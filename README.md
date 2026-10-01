@@ -83,6 +83,12 @@ npx -y @modelcontextprotocol/inspector --cli \
 The demo video script ([demo/demo_script.md](demo/demo_script.md)) follows
 exactly this path.
 
+No Alexa developer account? Use the bundled **web simulator** instead
+([simulator/](simulator/)): an Echo-style page that runs the same OAuth
+account-linking flow and calls the same 6 tools over Streamable HTTP, with
+a live JSON-RPC inspector. `./simulator/start.sh`, then open
+http://127.0.0.1:8799/.
+
 ## Tools
 
 | Tool | What it does |

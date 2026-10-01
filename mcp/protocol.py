@@ -100,9 +100,15 @@ def _initialize_result():
     }
 
 
-def handle_rpc(msg: dict, ctx) -> dict | None:
+def handle_rpc(msg: dict, ctx, scopes: set[str] | None = None) -> dict | None:
     """Dispatch one JSON-RPC message. Returns a response dict, or None for
-    notifications (transport should answer 202 with no body)."""
+    notifications (transport should answer 202 with no body).
+
+    `scopes` is the granted scope set of the bearer token that authorized
+    this request (None = unauthenticated; the transport rejects those
+    before we get here). tools/call and resources/read are checked
+    against TOOL_SCOPES / RESOURCE_SCOPES.
+    """
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
         return _err(None, INVALID_REQUEST, "Invalid JSON-RPC 2.0 message.")
     method = msg.get("method")
@@ -137,6 +143,15 @@ def handle_rpc(msg: dict, ctx) -> dict | None:
             return _err(msg_id, INVALID_PARAMS, "Missing 'name' for tools/call.")
         if not isinstance(arguments, dict):
             return _err(msg_id, INVALID_PARAMS, "'arguments' must be an object.")
+        required = tool_defs.TOOL_SCOPES.get(name)
+        if required is not None:
+            # Known tool: enforce the scope. Unknown names fall through to
+            # call_tool, which reports them as a tool-level isError result.
+            if scopes is None or required not in scopes:
+                return _err(
+                    msg_id, INVALID_PARAMS,
+                    f"Insufficient scope: '{name}' requires '{required}'.",
+                )
         text, is_error = tool_defs.call_tool(ctx.store, name, arguments)
         return _ok(
             msg_id,
@@ -150,6 +165,14 @@ def handle_rpc(msg: dict, ctx) -> dict | None:
         uri = params.get("uri")
         if not isinstance(uri, str):
             return _err(msg_id, INVALID_PARAMS, "Missing 'uri' for resources/read.")
+        required = tool_defs.RESOURCE_SCOPES.get(uri)
+        if required is None:
+            return _err(msg_id, INVALID_PARAMS, f"Unknown resource: {uri}")
+        if scopes is None or required not in scopes:
+            return _err(
+                msg_id, INVALID_PARAMS,
+                f"Insufficient scope: '{uri}' requires '{required}'.",
+            )
         text, is_error = tool_defs.read_resource(ctx.store, uri)
         if is_error:
             return _err(msg_id, INVALID_PARAMS, text)

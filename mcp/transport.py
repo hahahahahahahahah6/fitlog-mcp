@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -66,6 +67,52 @@ class ServerContext:
         # Empty string = no gate (local dev). Set = /authorize requires the
         # owner password first. main() refuses public exposure without it.
         self.owner_password = owner_password
+        # Rate limiter for owner-password attempts, keyed by client IP.
+        self.login_limiter = LoginRateLimiter()
+
+
+class LoginRateLimiter:
+    """Brute-force guard for the owner sign-in form.
+
+    After MAX_ATTEMPTS failed passwords from one IP inside WINDOW_SECONDS,
+    further attempts are rejected with HTTP 429 for LOCKOUT_SECONDS.
+    A successful sign-in clears the IP's failure count.
+    """
+
+    MAX_ATTEMPTS = 5
+    WINDOW_SECONDS = 900    # 15 minutes
+    LOCKOUT_SECONDS = 900   # 15 minutes
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._failures: dict[str, list[float]] = {}
+
+    def _prune_locked(self, key: str, now: float) -> list[float]:
+        recent = [t for t in self._failures.get(key, [])
+                  if now - t < self.WINDOW_SECONDS]
+        if recent:
+            self._failures[key] = recent
+        else:
+            self._failures.pop(key, None)
+        return recent
+
+    def is_blocked(self, key: str) -> bool:
+        now = time.time()
+        with self._lock:
+            recent = self._prune_locked(key, now)
+            if len(recent) < self.MAX_ATTEMPTS:
+                return False
+            # Blocked until the oldest failure in the window ages out, but
+            # at least LOCKOUT_SECONDS from the most recent failure.
+            return now - recent[-1] < self.LOCKOUT_SECONDS
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            self._failures.setdefault(key, []).append(time.time())
+
+    def record_success(self, key: str) -> None:
+        with self._lock:
+            self._failures.pop(key, None)
 
 
 def _origin_allowed(origin: str | None) -> bool:
@@ -177,14 +224,16 @@ class MCPHandler(BaseHTTPRequestHandler):
                 break
         return oauth.owner_cookie_valid(value, self.ctx.owner_password)
 
-    def _check_auth(self) -> bool:
-        """True if the request carries a valid bearer token."""
+    def _check_auth(self) -> set[str] | None:
+        """Return the granted scope set if the request carries a valid
+        bearer token, else send 401 and return None."""
         authz = self.headers.get("Authorization") or ""
         if authz.startswith("Bearer "):
-            if self.ctx.auth.validate_token(authz[7:].strip()):
-                return True
+            scopes = self.ctx.auth.token_scopes(authz[7:].strip())
+            if scopes is not None:
+                return scopes
         self._send_401()
-        return False
+        return None
 
     def _read_json_body(self):
         try:
@@ -288,7 +337,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             self._send_html(200, oauth.approval_page(params))
             return
         if path == "/mcp":
-            if not self._check_auth():
+            if self._check_auth() is None:
                 return
             self._handle_sse_stream()
             return
@@ -304,7 +353,7 @@ class MCPHandler(BaseHTTPRequestHandler):
                 404, self._rpc_error_envelope(INVALID_REQUEST, "Not found.")
             )
             return
-        if not self._check_auth():
+        if self._check_auth() is None:
             return
         sid = self.headers.get(SESSION_HEADER)
         if self.ctx.sessions.destroy(sid):
@@ -340,11 +389,21 @@ class MCPHandler(BaseHTTPRequestHandler):
             form = self._read_form_body()
             if self.ctx.owner_password and "owner_password" in form:
                 # Owner sign-in attempt from the login page.
+                client_ip = self.client_address[0]
+                if self.ctx.login_limiter.is_blocked(client_ip):
+                    self._send_html(
+                        429,
+                        "<h1>Too many attempts</h1>"
+                        "<p>Too many wrong passwords. Try again in 15 minutes.</p>",
+                    )
+                    return
                 if not hmac.compare_digest(
                         form.get("owner_password", ""),
                         self.ctx.owner_password):
+                    self.ctx.login_limiter.record_failure(client_ip)
                     self._send_html(403, "<h1>Wrong password</h1>")
                     return
+                self.ctx.login_limiter.record_success(client_ip)
                 params, err = oauth.validate_authorize_params(
                     form, self.ctx.canonical_resource
                 )
@@ -404,7 +463,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                 404, self._rpc_error_envelope(INVALID_REQUEST, "Not found.")
             )
             return
-        if not self._check_auth():
+        scopes = self._check_auth()
+        if scopes is None:
             return
         payload, err = self._read_json_body()
         if err:
@@ -475,7 +535,7 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.ctx.sessions.mark_initialized(sid)
 
         try:
-            r = handle_rpc(payload, self.ctx)
+            r = handle_rpc(payload, self.ctx, scopes)
         except Exception:  # never leak a traceback to the client
             r = {
                 "jsonrpc": "2.0",
@@ -531,7 +591,10 @@ def create_server(host: str, port: int, db_path: str | None = None,
             or f"http://{host}:{port}").rstrip("/")
     password = (owner_password if owner_password is not None
                 else os.environ.get("FITLOG_OWNER_PASSWORD", ""))
-    ctx = ServerContext(store, sessions, AuthState(api_token=token), base,
+    # OAuth codes/tokens live in the same SQLite file as the workouts, so
+    # they survive restarts.
+    ctx = ServerContext(store, sessions,
+                        AuthState(api_token=token, db_path=store.path), base,
                         owner_password=password)
     MCPHandler.ctx = ctx
     httpd = ThreadingHTTPServer((host, port), MCPHandler)

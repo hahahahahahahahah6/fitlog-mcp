@@ -26,6 +26,24 @@ DAY_ALIASES = {
 }
 
 LB_TO_KG = 0.45359237
+KG_TO_LB = 1.0 / LB_TO_KG
+
+# Scope required to call each tool. Read-only tools need fitlog.read;
+# tools that write data need fitlog.write.
+TOOL_SCOPES = {
+    "log_workout": "fitlog.write",
+    "get_history": "fitlog.read",
+    "get_personal_records": "fitlog.read",
+    "plan_workout": "fitlog.read",
+    "log_protein": "fitlog.write",
+    "get_nutrition_targets": "fitlog.read",
+}
+
+# Scopes required to read each resource (all read-only).
+RESOURCE_SCOPES = {
+    "program://current": "fitlog.read",
+    "pr://all": "fitlog.read",
+}
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -83,6 +101,25 @@ def _epley(weight_kg: float, reps: int) -> float:
     return round(weight_kg * (1 + reps / 30.0), 1)
 
 
+def _display_weight(weight_kg: float, unit: str) -> str:
+    """Format a kg weight in the user's unit. Never silently converts:
+    the caller passes the unit the user actually used ('kg' or 'lb').
+    lb values are rounded to 1 decimal (0.1 lb < 0.01 kg storage precision)."""
+    if unit.startswith("lb"):
+        return f"{round(weight_kg * KG_TO_LB, 1):g} lb"
+    return f"{weight_kg:g} kg"
+
+
+def _parse_unit(args: dict) -> tuple[str, str | None]:
+    """Return (normalized_unit, error). Normalized is 'kg' or 'lb'."""
+    unit = str(args.get("unit") or "kg").strip().lower()
+    if unit in ("lb", "lbs"):
+        return "lb", None
+    if unit == "kg":
+        return "kg", None
+    return "kg", "'unit' must be 'kg' or 'lb'."
+
+
 # ---------------------------------------------------------------- handlers
 
 def _h_log_workout(store: Store, args: dict) -> tuple[str, bool]:
@@ -91,10 +128,10 @@ def _h_log_workout(store: Store, args: dict) -> tuple[str, bool]:
         return "Missing required argument: 'exercise' (string).", True
     exercise = _normalize_exercise(exercise)
 
-    unit = str(args.get("unit") or "kg").strip().lower()
-    if unit not in ("kg", "lb", "lbs"):
-        return "'unit' must be 'kg' or 'lb'.", True
-    to_kg = LB_TO_KG if unit.startswith("lb") else 1.0
+    unit, err = _parse_unit(args)
+    if err:
+        return err, True
+    to_kg = LB_TO_KG if unit == "lb" else 1.0
 
     sets, err = _validate_sets(args.get("sets"))
     if err:
@@ -119,17 +156,23 @@ def _h_log_workout(store: Store, args: dict) -> tuple[str, bool]:
         + (f" on {date}." if date else " today.")
     ]
     for raw, conv in zip(sets, sets_kg):
-        if to_kg == 1.0:
+        # Echo the weight in the unit the user gave; the kg equivalent is
+        # parenthetical, never a replacement.
+        if unit == "kg":
             lines.append(f"  - {raw['reps']} reps x {raw['weight']:g} kg")
         else:
             lines.append(
-                f"  - {raw['reps']} reps x {raw['weight']:g} lb ({conv['weight']:g} kg)"
+                f"  - {raw['reps']} reps x {raw['weight']:g} lb"
             )
     if after.get("max_weight_kg", 0.0) > before_max:
-        lines.append(f"New PR for {exercise}: {after['max_weight_kg']:g} kg!")
+        # The new max comes from the sets just logged: report it in the
+        # exact unit/weight the user gave, not a kg round-trip.
+        new_max = max(s["weight"] for s in sets)
+        lines.append(f"New PR for {exercise}: {new_max:g} {unit}!")
     if after.get("estimated_1rm_kg", 0.0) > before_1rm:
         lines.append(
-            f"New estimated 1RM for {exercise}: {after['estimated_1rm_kg']:g} kg!"
+            f"New estimated 1RM for {exercise}: "
+            f"{_display_weight(after['estimated_1rm_kg'], unit)}!"
         )
     return "\n".join(lines), False
 
@@ -144,18 +187,26 @@ def _h_get_history(store: Store, args: dict) -> tuple[str, bool]:
         limit = int(args.get("limit", 10))
     except (TypeError, ValueError):
         return "'limit' must be an integer.", True
+    unit, err = _parse_unit(args)
+    if err:
+        return err, True
     rows = store.get_history(exercise, limit)
     if not rows:
         what = f" for {exercise}" if exercise else ""
         return f"No workouts logged{what} yet.", False
     lines = []
     for r in rows:
-        sets = ", ".join(f"{s['reps']}x{s['weight']}kg" for s in r["sets"])
+        sets = ", ".join(
+            f"{s['reps']}x{_display_weight(s['weight'], unit)}" for s in r["sets"]
+        )
         lines.append(f"{r['date']} — {r['exercise']}: {sets}")
     return "\n".join(lines), False
 
 
 def _h_get_personal_records(store: Store, args: dict) -> tuple[str, bool]:
+    unit, err = _parse_unit(args)
+    if err:
+        return err, True
     prs = store.get_personal_records()
     if not prs:
         return "No personal records yet. Log a workout first.", False
@@ -163,8 +214,10 @@ def _h_get_personal_records(store: Store, args: dict) -> tuple[str, bool]:
     for key in sorted(prs):
         p = prs[key]
         lines.append(
-            f"  - {p['display']}: {p['max_weight_kg']:g} kg x {p['reps_at_max']} reps"
-            f" (est. 1RM {p['estimated_1rm_kg']:g} kg)"
+            f"  - {p['display']}: "
+            f"{_display_weight(p['max_weight_kg'], unit)}"
+            f" x {p['reps_at_max']} reps"
+            f" (est. 1RM {_display_weight(p['estimated_1rm_kg'], unit)})"
         )
     return "\n".join(lines), False
 
@@ -286,6 +339,12 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "exercise": {"type": "string"},
                 "limit": {"type": "integer", "default": 10},
+                "unit": {
+                    "type": "string",
+                    "enum": ["kg", "lb"],
+                    "default": "kg",
+                    "description": "Weight unit for display",
+                },
             },
         },
         "annotations": {
@@ -298,7 +357,17 @@ TOOL_DEFINITIONS = [
     {
         "name": "get_personal_records",
         "description": "Current personal records per lift: heaviest set and estimated 1RM.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "unit": {
+                    "type": "string",
+                    "enum": ["kg", "lb"],
+                    "default": "kg",
+                    "description": "Weight unit for display",
+                },
+            },
+        },
         "annotations": {
             "readOnlyHint": True,
             "destructiveHint": False,

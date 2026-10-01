@@ -12,7 +12,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp import PROTOCOL_VERSION
-from mcp.transport import create_server
+from mcp.transport import LoginRateLimiter, MCPHandler, create_server
 
 EXPECTED_TOOLS = {
     "log_workout",
@@ -82,7 +82,7 @@ class FitLogServerTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read()
 
-    def _new_session(self):
+    def _new_session(self, token="test-token"):
         status, headers, body = self._post(
             {
                 "jsonrpc": "2.0",
@@ -95,6 +95,7 @@ class FitLogServerTest(unittest.TestCase):
                 },
             },
             version=None,
+            token=token,
         )
         self.assertEqual(status, 200)
         data = json.loads(body)
@@ -105,11 +106,12 @@ class FitLogServerTest(unittest.TestCase):
         status, _, _ = self._post(
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
             session=sid,
+            token=token,
         )
         self.assertEqual(status, 202)
         return sid
 
-    def _call(self, session, tool, arguments):
+    def _call(self, session, tool, arguments, token="test-token"):
         status, _, body = self._post(
             {
                 "jsonrpc": "2.0",
@@ -118,6 +120,7 @@ class FitLogServerTest(unittest.TestCase):
                 "params": {"name": tool, "arguments": arguments},
             },
             session=session,
+            token=token,
         )
         self.assertEqual(status, 200)
         data = json.loads(body)
@@ -682,6 +685,131 @@ class FitLogServerTest(unittest.TestCase):
         self.assertIn("Total on 2026-09-29", text)
         self.assertNotIn("Total today", text)
 
+    # -- scope enforcement ------------------------------------------------
+
+    def _oauth_token_with_scope(self, scope: str):
+        """Run the PKCE flow requesting a specific scope; return the token."""
+        import urllib.parse
+
+        jar = self._owner_jar()
+        verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        params = {
+            "response_type": "code",
+            "client_id": "alexa-plus",
+            "redirect_uri": "https://client.example/cb",
+            "scope": scope,
+            "state": "s1",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": self.public_url + "/mcp",
+        }
+        qs = urllib.parse.urlencode(params)
+        status, _, body = self._get("/authorize?" + qs, token=None, headers=jar)
+        self.assertEqual(status, 200)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        form = dict(params, approved="yes")
+        req = urllib.request.Request(
+            self.base + "/authorize",
+            data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     **jar},
+            method="POST",
+        )
+        try:
+            opener.open(req, timeout=10)
+            self.fail("expected 302")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 302)
+            loc = e.headers["Location"]
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+        token_form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://client.example/cb",
+            "code_verifier": verifier,
+            "resource": self.public_url + "/mcp",
+        }
+        req = urllib.request.Request(
+            self.base + "/token",
+            data=urllib.parse.urlencode(token_form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        self.assertEqual(data["scope"], scope)
+        return data["access_token"]
+
+    def test_read_only_token_cannot_write(self):
+        token = self._oauth_token_with_scope("fitlog.read")
+        sid = self._new_session(token=token)
+        # write tool -> JSON-RPC error about insufficient scope
+        status, _, body = self._post(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "log_workout",
+                        "arguments": {"exercise": "Squat",
+                                      "sets": [{"reps": 5, "weight": 100}]}}},
+            session=sid, token=token,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertIn("error", data)
+        self.assertIn("fitlog.write", data["error"]["message"])
+        # read tool -> works
+        res = self._call(sid, "get_personal_records", {}, token=token)
+        self.assertIn("content", res)
+
+    def test_write_token_can_write(self):
+        token = self._oauth_token_with_scope("fitlog.write")
+        sid = self._new_session(token=token)
+        res = self._call(sid, "log_protein", {"grams": 30}, token=token)
+        self.assertFalse(res["isError"])
+        # read tool -> blocked
+        status, _, body = self._post(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "get_personal_records", "arguments": {}}},
+            session=sid, token=token,
+        )
+        data = json.loads(body)
+        self.assertIn("error", data)
+        self.assertIn("fitlog.read", data["error"]["message"])
+
+    # -- unit preservation --------------------------------------------------
+
+    def test_lb_unit_preserved_in_response(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_workout", {
+            "exercise": "Bench Press",
+            "sets": [{"reps": 5, "weight": 185}],
+            "unit": "lb",
+        })
+        text = res["content"][0]["text"]
+        self.assertFalse(res["isError"])
+        # The user's unit is echoed; the PR is reported in lb, not kg.
+        self.assertIn("185 lb", text)
+        self.assertIn("New PR for Bench Press: 185 lb!", text)
+        self.assertNotIn("84 kg", text)
+        # get_personal_records with unit=lb also reports in lb.
+        prs = self._call(sid, "get_personal_records", {"unit": "lb"})
+        pr_text = prs["content"][0]["text"]
+        self.assertIn("185 lb", pr_text)
+        self.assertNotIn("kg", pr_text)
+
+    def test_kg_default_unchanged(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_workout", {
+            "exercise": "Overhead Press",
+            "sets": [{"reps": 5, "weight": 60}],
+        })
+        text = res["content"][0]["text"]
+        self.assertIn("60 kg", text)
+
 
 class OwnerGateTest(unittest.TestCase):
     """Tests for the FITLOG_OWNER_PASSWORD gate on /authorize."""
@@ -933,6 +1061,25 @@ class OwnerGateTest(unittest.TestCase):
             else:
                 _os.environ["FITLOG_OWNER_PASSWORD"] = old_pw
 
+    def test_rate_limit_after_five_wrong_passwords(self):
+        # Five wrong attempts -> 403 each; the sixth is 429 (locked out).
+        # The limiter lives on the handler's shared ServerContext; reset it
+        # first so this test does not interfere with (or inherit from) others.
+        MCPHandler.ctx.login_limiter = LoginRateLimiter()
+        try:
+            for i in range(5):
+                status, _, _ = self._sign_in("wrong-pw-%d" % i)
+                self.assertEqual(status, 403, f"attempt {i+1} should be 403")
+            status, _, body = self._sign_in("wrong-pw-5")
+            self.assertEqual(status, 429)
+            self.assertIn("Too many", body.decode())
+            # The right password is also blocked during lockout.
+            status, _, _ = self._sign_in(self.PASSWORD)
+            self.assertEqual(status, 429)
+        finally:
+            # Reset so later tests are not affected.
+            MCPHandler.ctx.login_limiter = LoginRateLimiter()
+
 
 class NoOwnerPasswordTest(unittest.TestCase):
     """Fail-closed /authorize: with no owner password configured, no login
@@ -1027,6 +1174,80 @@ class NoOwnerPasswordTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertNotIn("Set-Cookie", headers)
         self.assertNotIn("Location", headers)
+
+
+class OAuthPersistenceTest(unittest.TestCase):
+    """Codes and tokens survive a restart (SQLite, not memory)."""
+
+    def test_token_survives_new_authstate(self):
+        import tempfile
+
+        from mcp.auth import AuthState
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "oauth.db")
+            a1 = AuthState(db_path=db)
+            code = a1.issue_code(
+                challenge="E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                redirect_uri="https://client.example/cb",
+                resource="https://fitlog.example.com/mcp",
+                scope="fitlog.read",
+                client_id="alexa-plus",
+            )
+            token, scope, err = a1.redeem_code(
+                code=code,
+                verifier="dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                redirect_uri="https://client.example/cb",
+                resource="https://fitlog.example.com/mcp",
+            )
+            self.assertIsNone(err)
+            self.assertEqual(scope, "fitlog.read")
+            a1.close()
+
+            # "Restart": a brand-new AuthState on the same file.
+            a2 = AuthState(db_path=db)
+            try:
+                self.assertEqual(a2.token_scopes(token), {"fitlog.read"})
+            finally:
+                a2.close()
+
+    def test_code_single_use_persists(self):
+        import tempfile
+
+        from mcp.auth import AuthState
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "oauth2.db")
+            a1 = AuthState(db_path=db)
+            code = a1.issue_code(
+                challenge="E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                redirect_uri="https://client.example/cb",
+                resource="https://fitlog.example.com/mcp",
+                scope="fitlog.read fitlog.write",
+                client_id="alexa-plus",
+            )
+            a1.close()
+
+            a2 = AuthState(db_path=db)
+            try:
+                token, _, err = a2.redeem_code(
+                    code=code,
+                    verifier="dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                    redirect_uri="https://client.example/cb",
+                    resource="https://fitlog.example.com/mcp",
+                )
+                self.assertIsNone(err)
+                self.assertTrue(token)
+                # Second redeem fails: single use.
+                _, _, err2 = a2.redeem_code(
+                    code=code,
+                    verifier="dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                    redirect_uri="https://client.example/cb",
+                    resource="https://fitlog.example.com/mcp",
+                )
+                self.assertIsNotNone(err2)
+            finally:
+                a2.close()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,10 @@ loads it consents as the server owner. When FITLOG_OWNER_PASSWORD is set
 sets a short-lived HMAC-signed session cookie before the approval page
 is shown.
 
-Stdlib only. Tokens and codes live in memory; restart invalidates them.
+Stdlib only. Codes and tokens persist in SQLite (same DB file as the
+workout store when a db_path is given); a restart no longer invalidates
+outstanding codes/tokens. Tokens carry their granted scope, and the
+transport enforces fitlog.read / fitlog.write on every tool call.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import hashlib
 import hmac
 import html
 import secrets
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -38,6 +42,23 @@ SCOPES = ("fitlog.read", "fitlog.write")
 CODE_TTL = 600          # authorization codes live 10 minutes, single use
 TOKEN_TTL = 30 * 86400  # bearer tokens live 30 days
 
+OAUTH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code TEXT PRIMARY KEY,
+    challenge TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    expires REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    expires REAL NOT NULL
+);
+"""
+
 
 def pkce_challenge(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -45,13 +66,28 @@ def pkce_challenge(verifier: str) -> str:
 
 
 class AuthState:
-    """In-memory OAuth codes/tokens plus an optional static owner token."""
+    """OAuth codes/tokens in SQLite plus an optional static owner token.
 
-    def __init__(self, api_token: str | None = None):
+    db_path=None keeps everything in memory (used by unit tests); a real
+    path persists codes and tokens across restarts.
+    """
+
+    def __init__(self, api_token: str | None = None,
+                 db_path: str | None = None):
         self._lock = threading.Lock()
-        self._codes: dict[str, dict] = {}
-        self._tokens: dict[str, float] = {}
         self.api_token = api_token or ""
+        # check_same_thread=False: the HTTP server is threaded, all access
+        # is serialized with the lock.
+        self._conn = sqlite3.connect(db_path or ":memory:",
+                                     check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.executescript(OAUTH_SCHEMA)
+            self._conn.commit()
+
+    def close(self):
+        with self._lock:
+            self._conn.close()
 
     # -- issuance ------------------------------------------------------
 
@@ -60,61 +96,82 @@ class AuthState:
         code = secrets.token_urlsafe(32)
         with self._lock:
             self._prune_locked()
-            self._codes[code] = {
-                "challenge": challenge,
-                "redirect_uri": redirect_uri,
-                "resource": resource,
-                "scope": scope,
-                "client_id": client_id,
-                "expires": time.time() + CODE_TTL,
-            }
+            self._conn.execute(
+                "INSERT INTO oauth_codes "
+                "(code, challenge, redirect_uri, resource, scope, client_id,"
+                " expires) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (code, challenge, redirect_uri, resource, scope, client_id,
+                 time.time() + CODE_TTL),
+            )
+            self._conn.commit()
         return code
 
     def redeem_code(self, *, code: str, verifier: str, redirect_uri: str,
-                    resource: str) -> tuple[str | None, str | None]:
-        """Validate a code + PKCE verifier; return (token, error)."""
+                    resource: str) -> tuple[str | None, str | None, str | None]:
+        """Validate a code + PKCE verifier; return (token, scope, error)."""
         with self._lock:
-            rec = self._codes.pop(code, None)
-            if rec is None:
-                return None, "invalid_grant: unknown or reused code"
-            if time.time() > rec["expires"]:
-                return None, "invalid_grant: code expired"
-            if not hmac.compare_digest(rec["redirect_uri"], redirect_uri):
-                return None, "invalid_grant: redirect_uri mismatch"
-            if not hmac.compare_digest(rec["resource"], resource):
-                return None, "invalid_target: resource mismatch"
+            row = self._conn.execute(
+                "SELECT challenge, redirect_uri, resource, scope, expires"
+                " FROM oauth_codes WHERE code = ?",
+                (code,),
+            ).fetchone()
+            # Single use: delete the code whether or not validation passes.
+            self._conn.execute("DELETE FROM oauth_codes WHERE code = ?",
+                               (code,))
+            self._conn.commit()
+            if row is None:
+                return None, None, "invalid_grant: unknown or reused code"
+            if time.time() > row["expires"]:
+                return None, None, "invalid_grant: code expired"
+            if not hmac.compare_digest(row["redirect_uri"], redirect_uri):
+                return None, None, "invalid_grant: redirect_uri mismatch"
+            if not hmac.compare_digest(row["resource"], resource):
+                return None, None, "invalid_target: resource mismatch"
             try:
                 expect = pkce_challenge(verifier)
             except (UnicodeEncodeError, ValueError):
-                return None, "invalid_request: bad code_verifier"
-            if not hmac.compare_digest(expect, rec["challenge"]):
-                return None, "invalid_grant: PKCE verification failed"
+                return None, None, "invalid_request: bad code_verifier"
+            if not hmac.compare_digest(expect, row["challenge"]):
+                return None, None, "invalid_grant: PKCE verification failed"
             token = secrets.token_urlsafe(32)
-            self._tokens[token] = time.time() + TOKEN_TTL
-            return token, None
+            self._conn.execute(
+                "INSERT INTO oauth_tokens (token, scope, expires)"
+                " VALUES (?, ?, ?)",
+                (token, row["scope"], time.time() + TOKEN_TTL),
+            )
+            self._conn.commit()
+            return token, row["scope"], None
 
     # -- validation ----------------------------------------------------
 
-    def validate_token(self, token: str) -> bool:
+    def token_scopes(self, token: str) -> set[str] | None:
+        """Return the granted scope set for a token, or None if invalid."""
         if not token:
-            return False
+            return None
         if self.api_token and hmac.compare_digest(token, self.api_token):
-            return True
+            return set(SCOPES)  # the owner API token has full access
         with self._lock:
-            exp = self._tokens.get(token)
-            if exp is None:
-                return False
-            if time.time() > exp:
-                del self._tokens[token]
-                return False
-            return True
+            row = self._conn.execute(
+                "SELECT scope, expires FROM oauth_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                return None
+            if time.time() > row["expires"]:
+                self._conn.execute("DELETE FROM oauth_tokens WHERE token = ?",
+                                   (token,))
+                self._conn.commit()
+                return None
+            return set(row["scope"].split())
+
+    def validate_token(self, token: str) -> bool:
+        return self.token_scopes(token) is not None
 
     def _prune_locked(self) -> None:
         now = time.time()
-        for code in [c for c, r in self._codes.items() if now > r["expires"]]:
-            del self._codes[code]
-        for tok in [t for t, e in self._tokens.items() if now > e]:
-            del self._tokens[tok]
+        self._conn.execute("DELETE FROM oauth_codes WHERE expires <= ?", (now,))
+        self._conn.execute("DELETE FROM oauth_tokens WHERE expires <= ?", (now,))
+        self._conn.commit()
 
 
 # -- metadata documents ---------------------------------------------------
@@ -294,10 +351,10 @@ def handle_token_request(form: dict[str, str], auth: AuthState,
         return 400, {"error": "invalid_request",
                      "error_description": "code, code_verifier, redirect_uri and "
                                           "resource are all required"}
-    token, err = auth.redeem_code(code=code, verifier=verifier,
-                                  redirect_uri=redirect_uri, resource=resource)
+    token, scope, err = auth.redeem_code(code=code, verifier=verifier,
+                                          redirect_uri=redirect_uri, resource=resource)
     if err:
         kind, _, desc = err.partition(": ")
         return 400, {"error": kind, "error_description": desc}
     return 200, {"access_token": token, "token_type": "Bearer",
-                 "expires_in": TOKEN_TTL, "scope": " ".join(SCOPES)}
+                 "expires_in": TOKEN_TTL, "scope": scope}
