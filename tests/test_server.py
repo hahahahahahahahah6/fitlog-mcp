@@ -30,10 +30,12 @@ class FitLogServerTest(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         db = os.path.join(cls._tmp.name, "test.db")
         cls.api_token = "test-token"
+        cls.owner_password = "test-owner-pw"
         cls.public_url = "https://fitlog.example.com"
         cls.httpd, cls.store = create_server(
             "127.0.0.1", 0, db,
             api_token=cls.api_token, public_url=cls.public_url,
+            owner_password=cls.owner_password,
         )
         cls.port = cls.httpd.server_address[1]
         cls.base = f"http://127.0.0.1:{cls.port}"
@@ -69,8 +71,8 @@ class FitLogServerTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read()
 
-    def _get(self, path, token="test-token"):
-        headers = {}
+    def _get(self, path, token="test-token", headers=None):
+        headers = dict(headers or {})
         if token:
             headers["Authorization"] = f"Bearer {token}"
         req = urllib.request.Request(self.base + path, headers=headers, method="GET")
@@ -356,10 +358,55 @@ class FitLogServerTest(unittest.TestCase):
         self.assertTrue(doc["authorization_endpoint"].endswith("/authorize"))
         self.assertTrue(doc["token_endpoint"].endswith("/token"))
 
+    def _owner_jar(self):
+        """Owner sign-in round-trip; return {'Cookie': ...} for /authorize."""
+        import re
+        import urllib.parse
+
+        qs = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": "alexa-plus",
+            "redirect_uri": "https://client.example/cb",
+            "scope": "fitlog.read fitlog.write",
+            "state": "s1",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+            "resource": self.public_url + "/mcp",
+        })
+        status, _, body = self._get("/authorize?" + qs, token=None)
+        self.assertEqual(status, 200)
+        form = dict(re.findall(r'name="([^"]+)" value="([^"]*)"',
+                               body.decode()))
+        form["owner_password"] = self.owner_password
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        req = urllib.request.Request(
+            self.base + "/authorize",
+            data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            opener.open(req, timeout=10)
+            self.fail("expected 302")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 302)
+            set_cookie = e.headers.get("Set-Cookie", "")
+        for part in set_cookie.split(";"):
+            name, _, v = part.strip().partition("=")
+            if name == "fitlog_owner":
+                return {"Cookie": f"fitlog_owner={v.strip()}"}
+        self.fail("sign-in must set the owner cookie")
+
     def _oauth_token(self):
         """Run the full authorize -> token PKCE flow; return the token."""
         import urllib.parse
 
+        jar = self._owner_jar()
         verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"  # S256(verifier)
         params = {
@@ -373,7 +420,7 @@ class FitLogServerTest(unittest.TestCase):
             "resource": self.public_url + "/mcp",
         }
         qs = urllib.parse.urlencode(params)
-        status, _, body = self._get("/authorize?" + qs, token=None)
+        status, _, body = self._get("/authorize?" + qs, token=None, headers=jar)
         self.assertEqual(status, 200)
         self.assertIn("Approve", body.decode())
 
@@ -387,7 +434,8 @@ class FitLogServerTest(unittest.TestCase):
         req = urllib.request.Request(
             self.base + "/authorize",
             data=urllib.parse.urlencode(form).encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     **jar},
             method="POST",
         )
         try:
@@ -450,6 +498,7 @@ class FitLogServerTest(unittest.TestCase):
     def test_oauth_pkce_wrong_verifier(self):
         import urllib.parse
 
+        jar = self._owner_jar()
         # run the flow manually with a bad verifier
         challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         p = {
@@ -462,7 +511,8 @@ class FitLogServerTest(unittest.TestCase):
             "resource": self.public_url + "/mcp",
         }
         qs = urllib.parse.urlencode(p)
-        self.assertEqual(self._get("/authorize?" + qs, token=None)[0], 200)
+        self.assertEqual(
+            self._get("/authorize?" + qs, token=None, headers=jar)[0], 200)
 
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -473,7 +523,8 @@ class FitLogServerTest(unittest.TestCase):
         req = urllib.request.Request(
             self.base + "/authorize",
             data=urllib.parse.urlencode(form).encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     **jar},
             method="POST",
         )
         try:
@@ -881,6 +932,101 @@ class OwnerGateTest(unittest.TestCase):
                 _os.environ.pop("FITLOG_OWNER_PASSWORD", None)
             else:
                 _os.environ["FITLOG_OWNER_PASSWORD"] = old_pw
+
+
+class NoOwnerPasswordTest(unittest.TestCase):
+    """Fail-closed /authorize: with no owner password configured, no login
+    page, no approval page, and no codes — even when a public URL is set
+    (the tunneled-but-forgot-the-password scenario)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(cls._tmp.name, "nopw.db")
+        cls.public_url = "https://fitlog.example.com"
+        cls.httpd, cls.store = create_server(
+            "127.0.0.1", 0, db,
+            api_token="test-token", public_url=cls.public_url,
+            owner_password="",
+        )
+        cls.port = cls.httpd.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        cls._thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls._thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.store.close()
+        cls._tmp.cleanup()
+
+    def _oauth_params(self):
+        return {
+            "response_type": "code",
+            "client_id": "alexa-plus",
+            "redirect_uri": "https://client.example/cb",
+            "scope": "fitlog.read fitlog.write",
+            "state": "s1",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+            "resource": self.public_url + "/mcp",
+        }
+
+    def _raw(self, method, path, body=None, headers=None):
+        import urllib.parse
+
+        req = urllib.request.Request(
+            self.base + path, data=body, headers=headers or {}, method=method
+        )
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            with opener.open(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+
+    def test_get_authorize_refused_without_password(self):
+        import urllib.parse
+
+        status, _, body = self._raw(
+            "GET", "/authorize?" + urllib.parse.urlencode(self._oauth_params())
+        )
+        self.assertEqual(status, 503)
+        text = body.decode()
+        self.assertIn("Authorization unavailable", text)
+        self.assertNotIn('name="owner_password"', text)
+        self.assertNotIn("Approve", text)
+
+    def test_post_approve_refused_without_password(self):
+        import urllib.parse
+
+        form = dict(self._oauth_params(), approved="yes")
+        status, headers, _ = self._raw(
+            "POST", "/authorize",
+            body=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 403)
+        # no code issued: must not redirect to the client
+        self.assertNotIn("Location", headers)
+
+    def test_post_login_refused_without_password(self):
+        import urllib.parse
+
+        form = dict(self._oauth_params(), owner_password="anything")
+        status, headers, _ = self._raw(
+            "POST", "/authorize",
+            body=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertNotIn("Location", headers)
 
 
 if __name__ == "__main__":

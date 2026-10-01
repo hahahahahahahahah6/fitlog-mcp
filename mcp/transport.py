@@ -162,8 +162,10 @@ class MCPHandler(BaseHTTPRequestHandler):
         return False
 
     def _owner_logged_in(self) -> bool:
-        """True if the owner gate is off, or a valid owner session cookie
-        is present (the /authorize password sign-in sets it)."""
+        """True if a valid owner session cookie is present (the /authorize
+        password sign-in sets it). Callers refuse /authorize outright when
+        no owner password is configured, so this is only reached with the
+        gate armed — there is no fail-open path."""
         if not self.ctx.owner_password:
             return True
         cookie = self.headers.get("Cookie") or ""
@@ -259,6 +261,20 @@ class MCPHandler(BaseHTTPRequestHandler):
             if err:
                 self._send_html(400, f"<h1>Invalid authorization request</h1><p>{err}</p>")
                 return
+            if not self.ctx.owner_password:
+                # Fail closed: with no owner password configured, /authorize
+                # never shows a login or approval page and never issues
+                # codes. This does not depend on FITLOG_PUBLIC_URL, the
+                # listen address, or the client IP — a tunneled server whose
+                # operator forgot the password is still safe.
+                self._send_html(
+                    503,
+                    "<h1>Authorization unavailable</h1>"
+                    "<p>The server owner has not configured an owner "
+                    "password, so OAuth authorization is disabled on this "
+                    "server.</p>",
+                )
+                return
             if not self._owner_logged_in():
                 # Carry the already-validated request through the sign-in
                 # round-trip (response_type / challenge method are fixed by
@@ -311,6 +327,16 @@ class MCPHandler(BaseHTTPRequestHandler):
             self._send_json(code, body)
             return
         if path == "/authorize":
+            if not self.ctx.owner_password:
+                # Fail closed: no owner password means no codes, ever —
+                # not even via a forged approval POST.
+                self._send_html(
+                    403,
+                    "<h1>Authorization unavailable</h1>"
+                    "<p>The server owner has not configured an owner "
+                    "password, so no authorization codes are issued.</p>",
+                )
+                return
             form = self._read_form_body()
             if self.ctx.owner_password and "owner_password" in form:
                 # Owner sign-in attempt from the login page.
