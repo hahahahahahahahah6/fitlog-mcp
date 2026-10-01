@@ -22,6 +22,7 @@ Hard requirements implemented here:
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
@@ -55,12 +56,16 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 class ServerContext:
     def __init__(self, store: Store, sessions: SessionStore,
-                 auth: AuthState, public_url: str):
+                 auth: AuthState, public_url: str,
+                 owner_password: str = ""):
         self.store = store
         self.sessions = sessions
         self.auth = auth
         self.public_url = public_url
         self.canonical_resource = public_url.rstrip("/") + "/mcp"
+        # Empty string = no gate (local dev). Set = /authorize requires the
+        # owner password first. main() refuses public exposure without it.
+        self.owner_password = owner_password
 
 
 def _origin_allowed(origin: str | None) -> bool:
@@ -138,11 +143,37 @@ class MCPHandler(BaseHTTPRequestHandler):
         """True if the request may proceed; sends 403 and returns False if not."""
         if _origin_allowed(self.headers.get("Origin")):
             return True
+        # Same-origin posts from our own public URL (the OAuth authorize /
+        # login forms rendered in a browser) are legitimate.
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                o = urllib.parse.urlparse(origin)
+                p = urllib.parse.urlparse(self.ctx.public_url)
+                if (o.scheme, o.hostname, o.port or "") == \
+                   (p.scheme, p.hostname, p.port or ""):
+                    return True
+            except ValueError:
+                pass
         self._send_json(
             403,
             self._rpc_error_envelope(INVALID_REQUEST, "Origin not allowed."),
         )
         return False
+
+    def _owner_logged_in(self) -> bool:
+        """True if the owner gate is off, or a valid owner session cookie
+        is present (the /authorize password sign-in sets it)."""
+        if not self.ctx.owner_password:
+            return True
+        cookie = self.headers.get("Cookie") or ""
+        value = None
+        for part in cookie.split(";"):
+            name, _, v = part.strip().partition("=")
+            if name == oauth.OWNER_COOKIE:
+                value = v.strip().strip('"')
+                break
+        return oauth.owner_cookie_valid(value, self.ctx.owner_password)
 
     def _check_auth(self) -> bool:
         """True if the request carries a valid bearer token."""
@@ -228,6 +259,16 @@ class MCPHandler(BaseHTTPRequestHandler):
             if err:
                 self._send_html(400, f"<h1>Invalid authorization request</h1><p>{err}</p>")
                 return
+            if not self._owner_logged_in():
+                # Carry the already-validated request through the sign-in
+                # round-trip (response_type / challenge method are fixed by
+                # validate_authorize_params above).
+                self._send_html(200, oauth.login_page({
+                    **params,
+                    "response_type": "code",
+                    "code_challenge_method": "S256",
+                }))
+                return
             self._send_html(200, oauth.approval_page(params))
             return
         if path == "/mcp":
@@ -271,6 +312,43 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
         if path == "/authorize":
             form = self._read_form_body()
+            if self.ctx.owner_password and "owner_password" in form:
+                # Owner sign-in attempt from the login page.
+                if not hmac.compare_digest(
+                        form.get("owner_password", ""),
+                        self.ctx.owner_password):
+                    self._send_html(403, "<h1>Wrong password</h1>")
+                    return
+                params, err = oauth.validate_authorize_params(
+                    form, self.ctx.canonical_resource
+                )
+                if err:
+                    self._send_html(400, f"<h1>Invalid authorization request</h1><p>{err}</p>")
+                    return
+                cookie = oauth.owner_cookie_value(self.ctx.owner_password)
+                secure = "; Secure" if self.ctx.public_url.startswith("https") else ""
+                body = b"Signed in, redirecting..."
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    "/authorize?" + urllib.parse.urlencode({
+                        **params,
+                        "response_type": "code",
+                        "code_challenge_method": "S256",
+                    }),
+                )
+                self.send_header(
+                    "Set-Cookie",
+                    f"{oauth.OWNER_COOKIE}={cookie}; Path=/authorize; "
+                    f"HttpOnly; SameSite=Lax{secure}",
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if not self._owner_logged_in():
+                self._send_html(403, "<h1>Owner sign-in required</h1>")
+                return
             if form.get("approved") != "yes":
                 self._send_html(400, "<h1>Not approved</h1>")
                 return
@@ -418,21 +496,42 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 
 def create_server(host: str, port: int, db_path: str | None = None,
-                  api_token: str | None = None, public_url: str | None = None):
+                  api_token: str | None = None, public_url: str | None = None,
+                  owner_password: str | None = None):
     store = Store(db_path)
     sessions = SessionStore()
     token = api_token if api_token is not None else os.environ.get("FITLOG_API_TOKEN", "")
     base = (public_url or os.environ.get("FITLOG_PUBLIC_URL")
             or f"http://{host}:{port}").rstrip("/")
-    ctx = ServerContext(store, sessions, AuthState(api_token=token), base)
+    password = (owner_password if owner_password is not None
+                else os.environ.get("FITLOG_OWNER_PASSWORD", ""))
+    ctx = ServerContext(store, sessions, AuthState(api_token=token), base,
+                        owner_password=password)
     MCPHandler.ctx = ctx
     httpd = ThreadingHTTPServer((host, port), MCPHandler)
     return httpd, store
 
 
+def public_requires_password() -> str | None:
+    """Fail-fast rule: a publicly exposed server must gate /authorize.
+
+    Returns an error message when FITLOG_PUBLIC_URL is set but no
+    FITLOG_OWNER_PASSWORD is configured; None otherwise.
+    """
+    if os.environ.get("FITLOG_PUBLIC_URL") and not os.environ.get("FITLOG_OWNER_PASSWORD"):
+        return ("FITLOG_PUBLIC_URL is set but FITLOG_OWNER_PASSWORD is not: "
+                "refusing to expose the OAuth authorize page publicly without "
+                "an owner password. Set FITLOG_OWNER_PASSWORD to a strong value.")
+    return None
+
+
 def main():
     host = os.environ.get("FITLOG_HOST", "127.0.0.1")
     port = int(os.environ.get("FITLOG_PORT", "8765"))
+    err = public_requires_password()
+    if err:
+        print("error: " + err, file=sys.stderr)
+        sys.exit(1)
     httpd, _ = create_server(host, port)
     print("fitlog-mcp listening on http://%s:%d/mcp (bearer auth required)"
           % (host, port), flush=True)

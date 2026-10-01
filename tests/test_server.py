@@ -632,5 +632,256 @@ class FitLogServerTest(unittest.TestCase):
         self.assertNotIn("Total today", text)
 
 
+class OwnerGateTest(unittest.TestCase):
+    """Tests for the FITLOG_OWNER_PASSWORD gate on /authorize."""
+
+    PASSWORD = "s3cret-owner-pw"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(cls._tmp.name, "gate.db")
+        cls.public_url = "https://fitlog.example.com"
+        cls.httpd, cls.store = create_server(
+            "127.0.0.1", 0, db,
+            api_token="test-token", public_url=cls.public_url,
+            owner_password=cls.PASSWORD,
+        )
+        cls.port = cls.httpd.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        cls._thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls._thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.store.close()
+        cls._tmp.cleanup()
+
+    # -- helpers ----------------------------------------------------------
+
+    def _oauth_params(self):
+        return {
+            "response_type": "code",
+            "client_id": "alexa-plus",
+            "redirect_uri": "https://client.example/cb",
+            "scope": "fitlog.read fitlog.write",
+            "state": "s1",
+            "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            "code_challenge_method": "S256",
+            "resource": self.public_url + "/mcp",
+        }
+
+    def _raw(self, method, path, body=None, headers=None):
+        import urllib.parse
+
+        req = urllib.request.Request(
+            self.base + path, data=body, headers=headers or {}, method=method
+        )
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            with opener.open(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+
+    def _hidden_fields(self, html_body):
+        import re
+
+        return dict(re.findall(r'name="([^"]+)" value="([^"]*)"', html_body))
+
+    def _sign_in(self, password):
+        """POST the login form; return (status, headers, body, params)."""
+        import urllib.parse
+
+        status, _, body = self._raw(
+            "GET", "/authorize?" + urllib.parse.urlencode(self._oauth_params())
+        )
+        self.assertEqual(status, 200)
+        form = self._hidden_fields(body.decode())
+        form["owner_password"] = password
+        return self._raw(
+            "POST", "/authorize",
+            body=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    def _cookie_value(self, headers):
+        set_cookie = headers.get("Set-Cookie", "")
+        for part in set_cookie.split(";"):
+            name, _, v = part.strip().partition("=")
+            if name == "fitlog_owner":
+                return v.strip()
+        return None
+
+    # -- tests ------------------------------------------------------------
+
+    def test_login_page_shown_before_approval(self):
+        import urllib.parse
+
+        status, _, body = self._raw(
+            "GET", "/authorize?" + urllib.parse.urlencode(self._oauth_params())
+        )
+        self.assertEqual(status, 200)
+        text = body.decode()
+        self.assertIn('name="owner_password"', text)
+        self.assertNotIn("Approve", text)
+
+    def test_wrong_password_rejected(self):
+        status, _, body = self._sign_in("wrong-pw")
+        self.assertEqual(status, 403)
+        self.assertIn("Wrong password", body.decode())
+
+    def test_approve_without_signin_rejected(self):
+        import urllib.parse
+
+        form = dict(self._oauth_params(), approved="yes")
+        status, _, body = self._raw(
+            "POST", "/authorize",
+            body=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("Owner sign-in required", body.decode())
+
+    def test_tampered_cookie_rejected(self):
+        import urllib.parse
+
+        status, _, body = self._raw(
+            "GET", "/authorize?" + urllib.parse.urlencode(self._oauth_params()),
+            headers={"Cookie": "fitlog_owner=12345.deadbeef"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn('name="owner_password"', body.decode())
+
+    def test_full_gated_flow(self):
+        import urllib.parse
+
+        status, headers, _ = self._sign_in(self.PASSWORD)
+        self.assertEqual(status, 302)
+        cookie = self._cookie_value(headers)
+        self.assertTrue(cookie, "sign-in must set the owner cookie")
+        jar = {"Cookie": f"fitlog_owner={cookie}"}
+
+        # approval page now renders
+        status, _, body = self._raw(
+            "GET", "/authorize?" + urllib.parse.urlencode(self._oauth_params()),
+            headers=jar,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Approve", body.decode())
+
+        # approve with the cookie -> 302 with code
+        form = self._hidden_fields(body.decode())
+        form["approved"] = "yes"
+        status, headers, _ = self._raw(
+            "POST", "/authorize",
+            body=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     **jar},
+        )
+        self.assertEqual(status, 302)
+        q = urllib.parse.parse_qs(
+            urllib.parse.urlparse(headers["Location"]).query)
+        code = q["code"][0]
+
+        # token exchange
+        token_form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://client.example/cb",
+            "code_verifier": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+            "resource": self.public_url + "/mcp",
+        }
+        status, _, body = self._raw(
+            "POST", "/token",
+            body=urllib.parse.urlencode(token_form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(status, 200)
+        token = json.loads(body)["access_token"]
+        self.assertTrue(token)
+
+        # issued token works on /mcp
+        status, _, _ = self._raw(
+            "POST", "/mcp",
+            body=json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": PROTOCOL_VERSION,
+                           "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "0"}},
+            }).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(status, 200)
+
+    def test_same_origin_login_post_allowed(self):
+        import urllib.parse
+
+        status, _, body = self._raw(
+            "GET", "/authorize?" + urllib.parse.urlencode(self._oauth_params())
+        )
+        form = self._hidden_fields(body.decode())
+        form["owner_password"] = self.PASSWORD
+        # a browser posting the login form sends Origin: <public url>
+        status, _, _ = self._raw(
+            "POST", "/authorize",
+            body=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "Origin": self.public_url},
+        )
+        self.assertEqual(status, 302)
+
+    def test_cookie_signature_and_expiry(self):
+        from mcp import auth as oauth
+
+        good = oauth.owner_cookie_value(self.PASSWORD)
+        self.assertTrue(oauth.owner_cookie_valid(good, self.PASSWORD))
+        # tampered signature
+        ts, sig = good.split(".", 1)
+        self.assertFalse(
+            oauth.owner_cookie_valid(ts + "." + "0" * len(sig), self.PASSWORD))
+        # wrong password
+        self.assertFalse(oauth.owner_cookie_valid(good, "other"))
+        # expired (older than 2h TTL)
+        old = oauth.owner_cookie_value(self.PASSWORD,
+                                       now=__import__("time").time() - 3 * 3600)
+        self.assertFalse(oauth.owner_cookie_valid(old, self.PASSWORD))
+        # garbage / empty
+        self.assertFalse(oauth.owner_cookie_valid("garbage", self.PASSWORD))
+        self.assertFalse(oauth.owner_cookie_valid(None, self.PASSWORD))
+        self.assertFalse(oauth.owner_cookie_valid("", self.PASSWORD))
+
+    def test_public_requires_password_rule(self):
+        import os as _os
+        from mcp.transport import public_requires_password
+
+        old_pub = _os.environ.get("FITLOG_PUBLIC_URL")
+        old_pw = _os.environ.get("FITLOG_OWNER_PASSWORD")
+        try:
+            _os.environ.pop("FITLOG_PUBLIC_URL", None)
+            _os.environ.pop("FITLOG_OWNER_PASSWORD", None)
+            self.assertIsNone(public_requires_password())
+            _os.environ["FITLOG_PUBLIC_URL"] = "https://x.example"
+            self.assertIsNotNone(public_requires_password())
+            _os.environ["FITLOG_OWNER_PASSWORD"] = "pw"
+            self.assertIsNone(public_requires_password())
+        finally:
+            if old_pub is None:
+                _os.environ.pop("FITLOG_PUBLIC_URL", None)
+            else:
+                _os.environ["FITLOG_PUBLIC_URL"] = old_pub
+            if old_pw is None:
+                _os.environ.pop("FITLOG_OWNER_PASSWORD", None)
+            else:
+                _os.environ["FITLOG_OWNER_PASSWORD"] = old_pw
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,8 +12,11 @@ Implements exactly what the Alexa+ MCP authentication checklist requires:
     URI on both requests.
 
 Single-user demo posture: the approval page performs no login -- whoever
-loads it consents as the server owner. This is documented in the README;
-for a multi-user service this page would authenticate the user first.
+loads it consents as the server owner. When FITLOG_OWNER_PASSWORD is set
+(REQUIRED whenever FITLOG_PUBLIC_URL exposes the server publicly), the
+/authorize page first requires the owner password; a successful sign-in
+sets a short-lived HMAC-signed session cookie before the approval page
+is shown.
 
 Stdlib only. Tokens and codes live in memory; restart invalidates them.
 """
@@ -181,10 +184,76 @@ def validate_authorize_params(q: dict[str, str], canonical: str
     }, None
 
 
-def approval_page(params: dict) -> str:
+# -- owner sign-in gate --------------------------------------------------------
+
+OWNER_COOKIE = "fitlog_owner"
+OWNER_SESSION_TTL = 2 * 3600  # an owner sign-in lasts 2 hours
+
+
+def _owner_key(password: str) -> bytes:
+    return hashlib.sha256(
+        ("fitlog-owner-session:" + password).encode("utf-8")).digest()
+
+
+def owner_cookie_value(password: str, now: float | None = None) -> str:
+    """Build a signed owner-session cookie value: '<unix-ts>.<hex-sig>'."""
+    ts = str(int(now if now is not None else time.time()))
+    sig = hmac.new(
+        _owner_key(password), ("owner:" + ts).encode("utf-8"),
+        hashlib.sha256).hexdigest()
+    return ts + "." + sig
+
+
+def owner_cookie_valid(cookie_value: str | None, password: str,
+                       now: float | None = None) -> bool:
+    """Check a cookie value's signature and 2-hour expiry."""
+    if not cookie_value or not password:
+        return False
+    try:
+        ts, sig = cookie_value.split(".", 1)
+        ts_f = float(ts)
+    except ValueError:
+        return False
+    expect = owner_cookie_value(password, ts_f).split(".", 1)[1]
+    if not hmac.compare_digest(sig, expect):
+        return False
+    now_f = now if now is not None else time.time()
+    return 0 <= now_f - ts_f <= OWNER_SESSION_TTL
+
+
+def login_page(params: dict) -> str:
+    """Password form shown before the approval page when the owner gate is on.
+
+    Carries the OAuth request params as hidden fields so the redirect back
+    to /authorize after sign-in preserves them.
+    """
     hidden = "".join(
         f'<input type="hidden" name="{k}" value="{html.escape(v, quote=True)}">'
         for k, v in params.items()
+    )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>FitLog — owner sign-in</title></head>
+<body style="font-family:sans-serif;max-width:36em;margin:4em auto">
+<h1>FitLog owner sign-in</h1>
+<p>This is a single-user demo server. Enter the owner password to continue
+linking Alexa+ to <strong>your</strong> training log.</p>
+<form method="post" action="/authorize">
+{hidden}
+<label>Owner password:
+<input type="password" name="owner_password" autofocus
+ style="font-size:1.1em;padding:.3em"></label>
+<button type="submit" style="font-size:1.1em;padding:.4em 1.5em">Sign in</button>
+</form></body></html>"""
+
+
+def approval_page(params: dict) -> str:
+    hidden = "".join(
+        f'<input type="hidden" name="{k}" value="{html.escape(v, quote=True)}">'
+        for k, v in {
+            **params,
+            "response_type": "code",
+            "code_challenge_method": "S256",
+        }.items()
     )
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>FitLog — authorize</title></head>

@@ -21,16 +21,17 @@ cd fitlog-mcp
 python3 server.py
 ```
 
-The server listens on `http://0.0.0.0:8765` (`/mcp` endpoint).
+The server listens on `http://127.0.0.1:8765` (`/mcp` endpoint).
 Environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `FITLOG_PORT` | `8765` | listen port |
-| `FITLOG_HOST` | `0.0.0.0` | listen address |
+| `FITLOG_HOST` | `127.0.0.1` | listen address |
 | `FITLOG_DB` | `~/.fitlog/fitlog.db` | sqlite database path |
 | `FITLOG_API_TOKEN` | _(empty)_ | static bearer token for local dev / Inspector |
 | `FITLOG_PUBLIC_URL` | _(empty)_ | public HTTPS URL (e.g. cloudflared tunnel); used for OAuth metadata |
+| `FITLOG_OWNER_PASSWORD` | _(empty)_ | owner password for the `/authorize` page. **Required** when `FITLOG_PUBLIC_URL` is set — the server refuses to start publicly without it |
 | `FITLOG_ALLOWED_ORIGINS` | _(empty)_ | extra trusted `Origin` values, comma-separated |
 
 ## Connect an MCP client
@@ -67,6 +68,9 @@ npx -y @modelcontextprotocol/inspector --cli \
 1. Expose the server over HTTPS, e.g. with a cloudflared quick tunnel:
    `cloudflared tunnel --url http://127.0.0.1:8765`, and set
    `FITLOG_PUBLIC_URL=https://<your-tunnel>.trycloudflare.com`.
+   Also set `FITLOG_OWNER_PASSWORD` to a strong password — public exposure
+   without it is refused at startup, and the `/authorize` page will ask for
+   the password before showing the Approve button.
 2. Install the Alexa AI CLI (`npm install -g @alexa/alexa-ai` or per the
    [MCP toolkit quickstart](https://developer.amazon.com/docs/alexaplus/add-ons/mcp-toolkit-quickstart.html)).
 3. Put your tunnel URL into `addon-package/addon.json`

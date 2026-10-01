@@ -22,8 +22,9 @@ needed for that request travels over the encrypted (HTTPS) connection.
 ## Account linking
 
 Alexa+ links to your server with OAuth 2.1 authorization-code + PKCE (S256).
-The approval page grants access to whoever approves it — on a personal
-self-hosted instance, that is you, the server owner.
+Before the approval page is shown, the server requires the owner password
+you configured via `FITLOG_OWNER_PASSWORD` (mandatory for any public
+deployment), so only you can complete the linking.
 
 ## Your control
 
