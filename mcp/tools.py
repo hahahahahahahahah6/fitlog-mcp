@@ -7,6 +7,8 @@ idempotentHint / openWorldHint).
 from __future__ import annotations
 
 import datetime
+import math
+import re
 
 from store import NUTRITION_TARGETS, PROGRAM, Store
 
@@ -22,6 +24,28 @@ DAY_ALIASES = {
     "sat": "saturday",
     "sun": "sunday",
 }
+
+LB_TO_KG = 0.45359237
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _normalize_exercise(name: str) -> str:
+    """Collapse whitespace: voice input yields ' Bench Press', 'bench  press'."""
+    return " ".join(name.split())
+
+
+def _validate_date(value, field: str = "date") -> tuple[str | None, str | None]:
+    """Return (clean_date_or_None, error). Rejects 'yesterday' etc."""
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or not _DATE_RE.match(value):
+        return None, f"'{field}' must be YYYY-MM-DD (got {value!r})."
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return None, f"'{field}' must be a real calendar date (got {value!r})."
+    return value, None
 
 
 def _resolve_day(day: str | None) -> str | None:
@@ -43,40 +67,79 @@ def _validate_sets(sets) -> tuple[list[dict] | None, str | None]:
         try:
             reps = int(s["reps"])
             weight = float(s["weight"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             return None, f"sets[{i}] needs integer 'reps' and numeric 'weight'."
-        if reps <= 0 or weight < 0:
+        # Reject NaN / Infinity: float("1e309") is inf and would otherwise
+        # sail through and print "New PR: inf kg!".
+        if not math.isfinite(weight):
+            return None, f"sets[{i}].weight must be a finite number."
+        if isinstance(reps, bool) or reps <= 0 or weight < 0:
             return None, f"sets[{i}] needs reps > 0 and weight >= 0."
         clean.append({"reps": reps, "weight": weight})
     return clean, None
+
+
+def _epley(weight_kg: float, reps: int) -> float:
+    return round(weight_kg * (1 + reps / 30.0), 1)
 
 
 # ---------------------------------------------------------------- handlers
 
 def _h_log_workout(store: Store, args: dict) -> tuple[str, bool]:
     exercise = args.get("exercise")
-    if not exercise or not isinstance(exercise, str):
+    if not exercise or not isinstance(exercise, str) or not exercise.strip():
         return "Missing required argument: 'exercise' (string).", True
+    exercise = _normalize_exercise(exercise)
+
+    unit = str(args.get("unit") or "kg").strip().lower()
+    if unit not in ("kg", "lb", "lbs"):
+        return "'unit' must be 'kg' or 'lb'.", True
+    to_kg = LB_TO_KG if unit.startswith("lb") else 1.0
+
     sets, err = _validate_sets(args.get("sets"))
     if err:
         return err, True
-    date = args.get("date")
-    before = store.get_personal_records().get(exercise, {}).get("max_weight_kg", 0)
-    store.log_workout(exercise.strip(), sets, date)
+    date, err = _validate_date(args.get("date"))
+    if err:
+        return err, True
+
+    sets_kg = [
+        {"reps": s["reps"], "weight": round(s["weight"] * to_kg, 2)} for s in sets
+    ]
+
+    before = store.get_personal_records().get(exercise.lower(), {})
+    before_max = before.get("max_weight_kg", 0.0)
+    before_1rm = before.get("estimated_1rm_kg", 0.0)
+
+    store.log_workout(exercise, sets_kg, date)
+
+    after = store.get_personal_records().get(exercise.lower(), {})
     lines = [
-        f"Logged {exercise.strip()}: {len(sets)} sets"
+        f"Logged {exercise}: {len(sets_kg)} sets"
         + (f" on {date}." if date else " today.")
     ]
-    for s in sets:
-        lines.append(f"  - {s['reps']} reps x {s['weight']} kg")
-    new_max = max(s["weight"] for s in sets)
-    if new_max > before:
-        lines.append(f"New PR for {exercise.strip()}: {new_max} kg!")
+    for raw, conv in zip(sets, sets_kg):
+        if to_kg == 1.0:
+            lines.append(f"  - {raw['reps']} reps x {raw['weight']:g} kg")
+        else:
+            lines.append(
+                f"  - {raw['reps']} reps x {raw['weight']:g} lb ({conv['weight']:g} kg)"
+            )
+    if after.get("max_weight_kg", 0.0) > before_max:
+        lines.append(f"New PR for {exercise}: {after['max_weight_kg']:g} kg!")
+    if after.get("estimated_1rm_kg", 0.0) > before_1rm:
+        lines.append(
+            f"New estimated 1RM for {exercise}: {after['estimated_1rm_kg']:g} kg!"
+        )
     return "\n".join(lines), False
 
 
 def _h_get_history(store: Store, args: dict) -> tuple[str, bool]:
     exercise = args.get("exercise")
+    if exercise is not None:
+        if not isinstance(exercise, str) or not exercise.strip():
+            return "'exercise' must be a non-empty string.", True
+        exercise = _normalize_exercise(exercise)
     try:
         limit = int(args.get("limit", 10))
     except (TypeError, ValueError):
@@ -97,11 +160,11 @@ def _h_get_personal_records(store: Store, args: dict) -> tuple[str, bool]:
     if not prs:
         return "No personal records yet. Log a workout first.", False
     lines = ["Personal records:"]
-    for ex in sorted(prs):
-        p = prs[ex]
+    for key in sorted(prs):
+        p = prs[key]
         lines.append(
-            f"  - {ex}: {p['max_weight_kg']} kg x {p['reps_at_max']} reps"
-            f" (est. 1RM {p['estimated_1rm_kg']} kg) on {p['date']}"
+            f"  - {p['display']}: {p['max_weight_kg']:g} kg x {p['reps_at_max']} reps"
+            f" (est. 1RM {p['estimated_1rm_kg']:g} kg)"
         )
     return "\n".join(lines), False
 
@@ -125,14 +188,19 @@ def _h_plan_workout(store: Store, args: dict) -> tuple[str, bool]:
 def _h_log_protein(store: Store, args: dict) -> tuple[str, bool]:
     try:
         grams = float(args.get("grams"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "Missing required argument: 'grams' (number).", True
-    if grams <= 0 or grams > 500:
-        return "'grams' must be between 0 and 500.", True
-    total = store.log_protein(grams, args.get("date"))
+    if not math.isfinite(grams) or grams <= 0 or grams > 500:
+        return "'grams' must be a finite number between 0 and 500.", True
+    date, err = _validate_date(args.get("date"))
+    if err:
+        return err, True
+    total = store.log_protein(grams, date)
     lo, hi = NUTRITION_TARGETS["protein_g"]["min"], NUTRITION_TARGETS["protein_g"]["max"]
+    today = datetime.date.today().isoformat()
+    label = "Total today" if (date is None or date == today) else f"Total on {date}"
     return (
-        f"Logged {grams:g} g protein. Total today: {total:g} g "
+        f"Logged {grams:g} g protein. {label}: {total:g} g "
         f"(target {lo}-{hi} g).",
         False,
     )
@@ -172,7 +240,11 @@ def call_tool(store: Store, name: str, arguments: dict | None) -> tuple[str, boo
 TOOL_DEFINITIONS = [
     {
         "name": "log_workout",
-        "description": "Log a completed workout: an exercise with its sets of reps and weight in kg.",
+        "description": (
+            "Log a completed workout: an exercise with its sets of reps and "
+            "weight. Weight unit is kg by default; pass unit 'lb' for pounds. "
+            "Date is YYYY-MM-DD, defaults to today."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -183,18 +255,25 @@ TOOL_DEFINITIONS = [
                         "type": "object",
                         "properties": {
                             "reps": {"type": "integer"},
-                            "weight": {"type": "number", "description": "Weight in kg"},
+                            "weight": {"type": "number", "description": "Weight per set"},
                         },
                         "required": ["reps", "weight"],
                     },
+                },
+                "unit": {
+                    "type": "string",
+                    "enum": ["kg", "lb"],
+                    "default": "kg",
+                    "description": "Weight unit for the sets",
                 },
                 "date": {"type": "string", "description": "YYYY-MM-DD, defaults to today"},
             },
             "required": ["exercise", "sets"],
         },
         "annotations": {
+            # Append-only logging: nothing is deleted or overwritten.
             "readOnlyHint": False,
-            "destructiveHint": True,
+            "destructiveHint": False,
             "idempotentHint": False,
             "openWorldHint": False,
         },
@@ -229,7 +308,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "plan_workout",
-        "description": "Today's training plan from the stored 5-day split (or a given weekday).",
+        "description": "Today's training plan from the built-in 5-day split (or a given weekday).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -278,7 +357,7 @@ RESOURCE_DEFINITIONS = [
     {
         "uri": "program://current",
         "name": "Current training program",
-        "description": "The 5-day training split (back/chest/legs/arms/shoulders).",
+        "description": "The built-in 5-day training split (back/chest/legs/arms/shoulders).",
         "mimeType": "application/json",
     },
     {

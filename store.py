@@ -127,6 +127,7 @@ class Store:
         sets: list[dict],
         performed_at: str | None = None,
     ) -> int:
+        exercise = " ".join(exercise.split())  # normalize whitespace
         day = performed_at or _today()
         payload = json.dumps(sets)
         with self._lock:
@@ -142,11 +143,13 @@ class Store:
         limit = max(1, min(100, int(limit)))
         with self._lock:
             if exercise:
+                # Case- and whitespace-insensitive: "bench press",
+                # "Bench Press" and "  BENCH PRESS " are one lift.
                 rows = self._conn.execute(
                     "SELECT id, exercise, performed_at, sets_json FROM workouts"
                     " WHERE lower(exercise) = lower(?)"
                     " ORDER BY performed_at DESC, id DESC LIMIT ?",
-                    (exercise, limit),
+                    (" ".join(exercise.split()), limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
@@ -165,30 +168,48 @@ class Store:
         ]
 
     def get_personal_records(self) -> dict:
-        """Per-exercise best: heaviest set, its reps/date, and Epley 1RM estimate."""
+        """Per-exercise best, grouped case-insensitively ("bench press" ==
+        "Bench Press" == "  BENCH PRESS ").
+
+        Returns {canonical_key: {display, max_weight_kg, reps_at_max,
+        max_weight_date, estimated_1rm_kg, one_rm_date}}. The estimated 1RM
+        is the best Epley estimate across *every* logged set, not just the
+        heaviest one: 95 kg x 10 (est. ~127 kg) beats 100 kg x 1.
+        """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT exercise, performed_at, sets_json FROM workouts"
             ).fetchall()
         prs: dict[str, dict] = {}
         for r in rows:
+            display = " ".join(r["exercise"].split())
+            key = display.lower()
+            entry = prs.get(key)
+            if entry is None:
+                entry = prs[key] = {
+                    "display": display,
+                    "max_weight_kg": 0.0,
+                    "reps_at_max": 0,
+                    "max_weight_date": "",
+                    "estimated_1rm_kg": 0.0,
+                    "one_rm_date": "",
+                }
             for s in json.loads(r["sets_json"]):
                 try:
                     w = float(s.get("weight", 0))
                     reps = int(s.get("reps", 0))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     continue
                 if w <= 0 or reps <= 0:
                     continue
                 epley = round(w * (1 + reps / 30.0), 1)
-                cur = prs.get(r["exercise"])
-                if cur is None or w > cur["max_weight_kg"]:
-                    prs[r["exercise"]] = {
-                        "max_weight_kg": w,
-                        "reps_at_max": reps,
-                        "date": r["performed_at"],
-                        "estimated_1rm_kg": epley,
-                    }
+                if epley > entry["estimated_1rm_kg"]:
+                    entry["estimated_1rm_kg"] = epley
+                    entry["one_rm_date"] = r["performed_at"]
+                if w > entry["max_weight_kg"]:
+                    entry["max_weight_kg"] = w
+                    entry["reps_at_max"] = reps
+                    entry["max_weight_date"] = r["performed_at"]
         return prs
 
     # ---- nutrition -----------------------------------------------------

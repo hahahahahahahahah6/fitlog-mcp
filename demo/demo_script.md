@@ -1,45 +1,56 @@
 # fitlog-mcp — Demo Video Script (< 3 min, English)
 
 Target: public on YouTube/Vimeo, English narration, screen recording.
-Total budget: ~2:30.
+Total budget: ~2:40. All Alexa+ shots are the **official web simulator**
+with the FitLog add-on deployed to the development stage — no Echo needed.
 
 ## Shot list & narration
 
-**0:00–0:15 — Hook (terminal)**
-Show: empty terminal.
-Say: "Meet FitLog MCP — a self-hosted MCP server that turns Alexa+ into a
-gym coach. Zero dependencies, just Python's standard library."
+**0:00–0:15 — Hook (simulator)**
+Show: Alexa+ web simulator, empty conversation.
+Say: "Meet FitLog — an Alexa+ add-on backed by a self-hosted MCP server that
+gives Alexa a memory for your training life. Zero dependencies, just
+Python's standard library."
 
-**0:15–0:40 — Start the server (terminal)**
-Show: `python3 server.py` → "fitlog-mcp listening on http://127.0.0.1:8765/mcp".
-Say: "One command and it's live. It speaks MCP spec 2025-11-25 over Streamable
-HTTP — the same open standard that powers Alexa+ integrations."
+**0:15–0:35 — It's really connected (terminal, quick)**
+Show: `python3 server.py` → "listening on .../mcp (bearer auth required)";
+`cloudflared tunnel` URL; `alexa-ai deploy` → dev stage.
+Say: "One command starts the server. It's exposed over HTTPS, registered as
+an Alexa+ add-on, and locked down with OAuth 2.1 plus PKCE — unauthenticated
+requests get a 401, no exceptions."
 
-**0:40–1:20 — Log a workout (MCP Inspector, split screen with terminal)**
-Show: Inspector `tools/call log_workout` with exercise "Bench Press",
-sets 8x80, 6x85. Response: "New PR for Bench Press: 85 kg!"
-Say: "Log sets by voice through Alexa+, and the server remembers. It even
-detects personal records automatically — no spreadsheet, no app to open."
+**0:35–1:15 — Log a workout by voice (simulator)**
+Show: type/say "Ask FitLog to log my bench press: 5 reps at 185 pounds."
+Response shows the logged sets (auto-converted to kg) and a "New PR" callout.
+Say: "Log sets by voice right after your last rep — pounds work too. The
+server remembers every session and calls out personal records on its own.
+No spreadsheet, no app to open."
 
-**1:20–1:50 — Ask for records + today's plan (Inspector)**
-Show: `get_personal_records` → PR table; `plan_workout` → today's split.
-Say: "Ask for your records any time, or get today's plan from your stored
-five-day split. It knows it's leg day without being told."
+**1:15–1:45 — Records + today's plan (simulator)**
+Show: "Ask FitLog what my squat personal record is" → PR with estimated 1RM;
+"Ask FitLog what today's workout plan is" → the day's split.
+Say: "Ask for any record any time — with estimated one-rep maxes computed
+across every set, not just your heaviest. And whatever day it is, it knows
+the plan."
 
-**1:50–2:10 — Nutrition (Inspector)**
-Show: `log_protein` 45 g → `get_nutrition_targets` → "45 g logged, 115 g
-short of the 160–190 target".
+**1:45–2:05 — Protein (simulator)**
+Show: "Ask FitLog to log 45 grams of protein" → "Total today: 45 g (target
+160–190 g)."
 Say: "Protein gets the same treatment — log it through the day and always
 know where you stand against your target."
 
-**2:10–2:30 — Under the hood (code, brief)**
-Show: quick scroll of `mcp/transport.py` (Origin validation, session
-lifecycle) and the test run `python3 -m unittest` → OK.
-Say: "Under the hood: hand-rolled Streamable HTTP with mandatory Origin
-validation and session lifecycle, fully tested. Self-host it on anything
-that runs Python. That's FitLog MCP — your training, remembered."
+**2:05–2:40 — Under the hood (terminal + code, brief)**
+Show: `curl` to `/mcp` without a token → `401` (note: no WWW-Authenticate
+header — Alexa+ requires exactly that); `python3 -m unittest` → OK, 31
+tests; a timed `tools/call` through the tunnel → under 500 ms.
+Say: "Under the hood: hand-rolled Streamable HTTP on MCP spec 2025-11-25,
+OAuth 2.1 with PKCE account linking, mandatory Origin validation, and a
+full test suite — including the auth flow itself. Round trips stay under
+Alexa's 500 millisecond budget. That's FitLog — your training, remembered."
 
 ## Recording notes
-- 1080p screen capture; zoom terminal to ≥18pt font.
+- 1080p screen capture; terminal font ≥18pt.
 - Use a fresh DB (`FITLOG_DB=/tmp/demo.db`) so PRs trigger on camera.
-- Keep each Inspector call snappy; pre-type the JSON arguments.
+- Deploy the add-on to the dev stage before recording; enable it in the
+  simulator. Pre-link the account so the OAuth screen doesn't eat clock.
+- Keep narration tight; each simulator turn should resolve in one shot.

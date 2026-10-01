@@ -110,7 +110,12 @@ def handle_rpc(msg: dict, ctx) -> dict | None:
         return _err(msg.get("id"), INVALID_REQUEST, "Missing 'method'.")
     msg_id = msg.get("id")
     is_notification = "id" not in msg
-    params = msg.get("params") or {}
+    params = msg.get("params")
+    if params is None:
+        params = {}
+    elif not isinstance(params, dict):
+        # e.g. "params": [...] -- a client bug, not an internal error.
+        return _err(msg_id, INVALID_PARAMS, "'params' must be an object.")
 
     if method == "initialize":
         # Version negotiation: we speak 2025-11-25; echo it back.

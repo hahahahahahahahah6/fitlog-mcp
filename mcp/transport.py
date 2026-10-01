@@ -4,12 +4,20 @@ Single MCP endpoint with POST for client->server JSON-RPC, optional GET for
 an SSE stream, and DELETE for explicit session termination.
 
 Hard requirements implemented here:
+  * Bearer auth on every /mcp request (OAuth 2.1 + PKCE issued tokens, or
+    the FITLOG_API_TOKEN owner token). Unauthenticated -> HTTP 401 with NO
+    WWW-Authenticate header, per the Alexa+ MCP authentication checklist.
+  * OAuth discovery: RFC 9728 Protected Resource Metadata at
+    /.well-known/oauth-protected-resource and authorization server metadata
+    at /.well-known/oauth-authorization-server (S256 PKCE required).
   * Origin header MUST-validation on every Streamable HTTP request:
     a present-but-untrusted Origin -> HTTP 403 (DNS-rebinding mitigation).
   * MCP-Protocol-Version header on every post-initialize request:
     an unsupported version -> HTTP 400.
   * Mcp-Session-Id lifecycle: issued at initialize, required afterwards,
     revoked on DELETE (later use -> 404).
+  * JSON-RPC batch (top-level array) is rejected: the 2025-11-25 spec
+    removed batching -> HTTP 400 / -32600.
 """
 
 from __future__ import annotations
@@ -22,6 +30,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from mcp import PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION
+from mcp import auth as oauth
+from mcp.auth import AuthState
 from mcp.protocol import (
     INTERNAL_ERROR,
     INVALID_REQUEST,
@@ -44,9 +54,13 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class ServerContext:
-    def __init__(self, store: Store, sessions: SessionStore):
+    def __init__(self, store: Store, sessions: SessionStore,
+                 auth: AuthState, public_url: str):
         self.store = store
         self.sessions = sessions
+        self.auth = auth
+        self.public_url = public_url
+        self.canonical_resource = public_url.rstrip("/") + "/mcp"
 
 
 def _origin_allowed(origin: str | None) -> bool:
@@ -61,6 +75,10 @@ def _origin_allowed(origin: str | None) -> bool:
     except ValueError:
         return False
     return host.lower() in LOCAL_HOSTS
+
+
+def _first_values(qs: dict[str, list[str]]) -> dict[str, str]:
+    return {k: v[0] for k, v in qs.items() if v}
 
 
 class MCPHandler(BaseHTTPRequestHandler):
@@ -84,6 +102,31 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, code: int, html_body: str):
+        body = html_body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_401(self):
+        # Alexa+ REQUIRES 401 *without* a WWW-Authenticate header for
+        # unauthenticated requests -- the opposite of vanilla MCP.
+        body = json.dumps({
+            "error": "invalid_token",
+            "error_description": (
+                "Missing or invalid bearer token. Authenticate with "
+                "OAuth 2.1 + PKCE; see /.well-known/oauth-protected-resource."
+            ),
+        }).encode()
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        # NOTE: no WWW-Authenticate header here, on purpose.
+        self.end_headers()
+        self.wfile.write(body)
+
     def _rpc_error_envelope(self, code: int, message: str):
         return {
             "jsonrpc": "2.0",
@@ -101,6 +144,15 @@ class MCPHandler(BaseHTTPRequestHandler):
         )
         return False
 
+    def _check_auth(self) -> bool:
+        """True if the request carries a valid bearer token."""
+        authz = self.headers.get("Authorization") or ""
+        if authz.startswith("Bearer "):
+            if self.ctx.auth.validate_token(authz[7:].strip()):
+                return True
+        self._send_401()
+        return False
+
     def _read_json_body(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -114,6 +166,14 @@ class MCPHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return None, "Malformed JSON body."
 
+    def _read_form_body(self) -> dict[str, str]:
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        return _first_values(urllib.parse.parse_qs(raw.decode("utf-8", "replace")))
+
     # -- routing ----------------------------------------------------------
 
     def do_OPTIONS(self):
@@ -124,7 +184,7 @@ class MCPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header(
             "Access-Control-Allow-Headers",
-            f"Content-Type, Accept, {SESSION_HEADER}, {VERSION_HEADER}",
+            f"Content-Type, Accept, Authorization, {SESSION_HEADER}, {VERSION_HEADER}",
         )
         self.send_header("Access-Control-Expose-Headers", SESSION_HEADER)
         self.send_header("Content-Length", "0")
@@ -134,7 +194,8 @@ class MCPHandler(BaseHTTPRequestHandler):
         if not self._check_origin():
             return
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/health":
+        path = parsed.path
+        if path == "/health":
             self._send_json(
                 200,
                 {
@@ -142,11 +203,36 @@ class MCPHandler(BaseHTTPRequestHandler):
                     "server": SERVER_NAME,
                     "version": SERVER_VERSION,
                     "protocol": PROTOCOL_VERSION,
+                    "auth": "oauth2-pkce",
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 },
             )
             return
-        if parsed.path == "/mcp":
+        if path in ("/.well-known/oauth-protected-resource",
+                    "/.well-known/oauth-protected-resource/mcp"):
+            self._send_json(
+                200,
+                oauth.protected_resource_metadata(
+                    self.ctx.public_url, self.ctx.canonical_resource
+                ),
+            )
+            return
+        if path == "/.well-known/oauth-authorization-server":
+            self._send_json(
+                200, oauth.authorization_server_metadata(self.ctx.public_url)
+            )
+            return
+        if path == "/authorize":
+            q = _first_values(urllib.parse.parse_qs(parsed.query))
+            params, err = oauth.validate_authorize_params(q, self.ctx.canonical_resource)
+            if err:
+                self._send_html(400, f"<h1>Invalid authorization request</h1><p>{err}</p>")
+                return
+            self._send_html(200, oauth.approval_page(params))
+            return
+        if path == "/mcp":
+            if not self._check_auth():
+                return
             self._handle_sse_stream()
             return
         self._send_json(
@@ -161,6 +247,8 @@ class MCPHandler(BaseHTTPRequestHandler):
                 404, self._rpc_error_envelope(INVALID_REQUEST, "Not found.")
             )
             return
+        if not self._check_auth():
+            return
         sid = self.headers.get(SESSION_HEADER)
         if self.ctx.sessions.destroy(sid):
             self._send_json(200, {"terminated": True})
@@ -173,27 +261,75 @@ class MCPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._check_origin():
             return
-        if urllib.parse.urlparse(self.path).path != "/mcp":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/token":
+            form = self._read_form_body()
+            code, body = oauth.handle_token_request(
+                form, self.ctx.auth, self.ctx.canonical_resource
+            )
+            self._send_json(code, body)
+            return
+        if path == "/authorize":
+            form = self._read_form_body()
+            if form.get("approved") != "yes":
+                self._send_html(400, "<h1>Not approved</h1>")
+                return
+            params, err = oauth.validate_authorize_params(
+                form, self.ctx.canonical_resource
+            )
+            if err:
+                self._send_html(400, f"<h1>Invalid authorization request</h1><p>{err}</p>")
+                return
+            issued = self.ctx.auth.issue_code(
+                challenge=form["code_challenge"],
+                redirect_uri=params["redirect_uri"],
+                resource=params["resource"],
+                scope=params["scope"],
+                client_id=params["client_id"],
+            )
+            location = oauth.build_code_redirect(params, issued)
+            body = b"Redirecting..."
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path != "/mcp":
             self._send_json(
                 404, self._rpc_error_envelope(INVALID_REQUEST, "Not found.")
             )
+            return
+        if not self._check_auth():
             return
         payload, err = self._read_json_body()
         if err:
             self._send_json(400, self._rpc_error_envelope(INVALID_REQUEST, err))
             return
-        try:
-            method = (
-                payload.get("method")
-                if isinstance(payload, dict)
-                else None
+        if isinstance(payload, list):
+            # MCP 2025-11-25 removed JSON-RPC batching.
+            self._send_json(
+                400,
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Batch requests are not supported.",
+                    },
+                },
             )
-        except AttributeError:
-            method = None
+            return
+        if not isinstance(payload, dict):
+            self._send_json(
+                400, self._rpc_error_envelope(INVALID_REQUEST, "Malformed JSON-RPC message.")
+            )
+            return
+        method = payload.get("method")
 
         extra_headers: dict[str, str] = {}
 
-        if isinstance(payload, dict) and method == "initialize":
+        if method == "initialize":
             # initialize is the one call that needs no session and no
             # version header; the server issues the session here.
             resp = handle_rpc(payload, self.ctx)
@@ -231,31 +367,25 @@ class MCPHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if method == "notifications/initialized" and isinstance(payload, dict):
+        if method == "notifications/initialized":
             self.ctx.sessions.mark_initialized(sid)
 
-        messages = payload if isinstance(payload, list) else [payload]
-        responses = []
-        for m in messages:
-            try:
-                r = handle_rpc(m, self.ctx)
-            except Exception:  # never leak a traceback to the client
-                r = {
-                    "jsonrpc": "2.0",
-                    "id": m.get("id") if isinstance(m, dict) else None,
-                    "error": {"code": INTERNAL_ERROR, "message": "Internal error."},
-                }
-            if r is not None:
-                responses.append(r)
+        try:
+            r = handle_rpc(payload, self.ctx)
+        except Exception:  # never leak a traceback to the client
+            r = {
+                "jsonrpc": "2.0",
+                "id": payload.get("id"),
+                "error": {"code": INTERNAL_ERROR, "message": "Internal error."},
+            }
 
-        if not responses:
-            # Pure notification batch -> 202 Accepted, no body.
+        if r is None:
+            # Pure notification -> 202 Accepted, no body.
             self.send_response(202)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        out = responses if isinstance(payload, list) else responses[0]
-        self._send_json(200, out, extra_headers)
+        self._send_json(200, r, extra_headers)
 
     # -- SSE stream (optional GET) ----------------------------------------
 
@@ -287,10 +417,15 @@ class MCPHandler(BaseHTTPRequestHandler):
             pass
 
 
-def create_server(host: str, port: int, db_path: str | None = None):
+def create_server(host: str, port: int, db_path: str | None = None,
+                  api_token: str | None = None, public_url: str | None = None):
     store = Store(db_path)
     sessions = SessionStore()
-    MCPHandler.ctx = ServerContext(store, sessions)
+    token = api_token if api_token is not None else os.environ.get("FITLOG_API_TOKEN", "")
+    base = (public_url or os.environ.get("FITLOG_PUBLIC_URL")
+            or f"http://{host}:{port}").rstrip("/")
+    ctx = ServerContext(store, sessions, AuthState(api_token=token), base)
+    MCPHandler.ctx = ctx
     httpd = ThreadingHTTPServer((host, port), MCPHandler)
     return httpd, store
 
@@ -299,7 +434,8 @@ def main():
     host = os.environ.get("FITLOG_HOST", "127.0.0.1")
     port = int(os.environ.get("FITLOG_PORT", "8765"))
     httpd, _ = create_server(host, port)
-    print(f"fitlog-mcp listening on http://{host}:{port}/mcp", flush=True)
+    print("fitlog-mcp listening on http://%s:%d/mcp (bearer auth required)"
+          % (host, port), flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -29,7 +29,12 @@ class FitLogServerTest(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
         db = os.path.join(cls._tmp.name, "test.db")
-        cls.httpd, cls.store = create_server("127.0.0.1", 0, db)
+        cls.api_token = "test-token"
+        cls.public_url = "https://fitlog.example.com"
+        cls.httpd, cls.store = create_server(
+            "127.0.0.1", 0, db,
+            api_token=cls.api_token, public_url=cls.public_url,
+        )
         cls.port = cls.httpd.server_address[1]
         cls.base = f"http://127.0.0.1:{cls.port}"
         cls._thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
@@ -44,8 +49,10 @@ class FitLogServerTest(unittest.TestCase):
     # -- helpers ----------------------------------------------------------
 
     def _post(self, payload, session=None, version=PROTOCOL_VERSION,
-              origin=None, raw_body=None):
+              origin=None, raw_body=None, token="test-token"):
         headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if session:
             headers["Mcp-Session-Id"] = session
         if version is not None:
@@ -56,6 +63,17 @@ class FitLogServerTest(unittest.TestCase):
         req = urllib.request.Request(
             self.base + "/mcp", data=body, headers=headers, method="POST"
         )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read()
+
+    def _get(self, path, token="test-token"):
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(self.base + path, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status, dict(resp.headers), resp.read()
@@ -136,7 +154,7 @@ class FitLogServerTest(unittest.TestCase):
         self.assertEqual({t["name"] for t in tools}, EXPECTED_TOOLS)
         by_name = {t["name"]: t for t in tools}
         # annotation spot checks
-        self.assertTrue(by_name["log_workout"]["annotations"]["destructiveHint"])
+        self.assertFalse(by_name["log_workout"]["annotations"]["destructiveHint"])
         self.assertFalse(by_name["log_workout"]["annotations"]["readOnlyHint"])
         self.assertTrue(by_name["get_history"]["annotations"]["readOnlyHint"])
         self.assertTrue(by_name["get_personal_records"]["annotations"]["readOnlyHint"])
@@ -164,7 +182,7 @@ class FitLogServerTest(unittest.TestCase):
 
         prs = self._call(sid, "get_personal_records", {})
         pr_text = prs["content"][0]["text"]
-        self.assertIn("Bench Press", pr_text)
+        self.assertIn("bench press", pr_text.lower())
         self.assertIn("85", pr_text)
 
     def test_log_workout_validation(self):
@@ -270,7 +288,10 @@ class FitLogServerTest(unittest.TestCase):
         sid = self._new_session()
         req = urllib.request.Request(
             self.base + "/mcp",
-            headers={"Mcp-Session-Id": sid},
+            headers={
+                "Mcp-Session-Id": sid,
+                "Authorization": "Bearer test-token",
+            },
             method="DELETE",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -283,7 +304,10 @@ class FitLogServerTest(unittest.TestCase):
         # double delete -> 404
         req = urllib.request.Request(
             self.base + "/mcp",
-            headers={"Mcp-Session-Id": sid},
+            headers={
+                "Mcp-Session-Id": sid,
+                "Authorization": "Bearer test-token",
+            },
             method="DELETE",
         )
         try:
@@ -291,6 +315,321 @@ class FitLogServerTest(unittest.TestCase):
             self.fail("expected 404")
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 404)
+
+    # -- auth (Alexa+ checklist) ----------------------------------------------
+
+    def test_unauthenticated_gets_401_without_www_authenticate(self):
+        status, headers, body = self._post(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": PROTOCOL_VERSION}},
+            token=None,
+        )
+        self.assertEqual(status, 401)
+        # Alexa+ forbids the WWW-Authenticate header on 401s.
+        self.assertNotIn("WWW-Authenticate", headers)
+        self.assertNotIn("Www-Authenticate", headers)
+        self.assertIn("oauth-protected-resource", body.decode())
+
+    def test_bad_token_gets_401(self):
+        status, _, _ = self._post(
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"}, token="wrong"
+        )
+        self.assertEqual(status, 401)
+
+    def test_protected_resource_metadata(self):
+        status, _, body = self._get(
+            "/.well-known/oauth-protected-resource", token=None
+        )
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertEqual(doc["resource"], self.public_url + "/mcp")
+        self.assertIn(self.public_url, doc["authorization_servers"])
+        self.assertIn("fitlog.write", doc["scopes_supported"])
+
+    def test_authorization_server_metadata(self):
+        status, _, body = self._get(
+            "/.well-known/oauth-authorization-server", token=None
+        )
+        self.assertEqual(status, 200)
+        doc = json.loads(body)
+        self.assertIn("S256", doc["code_challenge_methods_supported"])
+        self.assertTrue(doc["authorization_endpoint"].endswith("/authorize"))
+        self.assertTrue(doc["token_endpoint"].endswith("/token"))
+
+    def _oauth_token(self):
+        """Run the full authorize -> token PKCE flow; return the token."""
+        import urllib.parse
+
+        verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"  # S256(verifier)
+        params = {
+            "response_type": "code",
+            "client_id": "alexa-plus",
+            "redirect_uri": "https://client.example/cb",
+            "scope": "fitlog.read fitlog.write",
+            "state": "s1",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": self.public_url + "/mcp",
+        }
+        qs = urllib.parse.urlencode(params)
+        status, _, body = self._get("/authorize?" + qs, token=None)
+        self.assertEqual(status, 200)
+        self.assertIn("Approve", body.decode())
+
+        # approve: POST the form, do not follow the 302
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        form = dict(params, approved="yes")
+        req = urllib.request.Request(
+            self.base + "/authorize",
+            data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            opener.open(req, timeout=10)
+            self.fail("expected 302")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 302)
+            loc = e.headers["Location"]
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        self.assertEqual(q["state"], ["s1"])
+        code = q["code"][0]
+
+        # token exchange
+        token_form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://client.example/cb",
+            "code_verifier": verifier,
+            "resource": self.public_url + "/mcp",
+        }
+        req = urllib.request.Request(
+            self.base + "/token",
+            data=urllib.parse.urlencode(token_form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        self.assertEqual(data["token_type"], "Bearer")
+        return data["access_token"], params, verifier
+
+    def test_oauth_pkce_flow_end_to_end(self):
+        token, _, _ = self._oauth_token()
+        # the issued token works on the MCP endpoint: initialize, then ping
+        status, headers, body = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            },
+            token=token,
+            version=None,
+        )
+        self.assertEqual(status, 200)
+        sid = headers.get("Mcp-Session-Id")
+        self.assertTrue(sid)
+        status, _, body = self._post(
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+            session=sid,
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["result"], {})
+
+    def test_oauth_pkce_wrong_verifier(self):
+        import urllib.parse
+
+        # run the flow manually with a bad verifier
+        challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        p = {
+            "response_type": "code",
+            "client_id": "alexa-plus",
+            "redirect_uri": "https://client.example/cb",
+            "scope": "fitlog.read",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "resource": self.public_url + "/mcp",
+        }
+        qs = urllib.parse.urlencode(p)
+        self.assertEqual(self._get("/authorize?" + qs, token=None)[0], 200)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirect)
+        form = dict(p, approved="yes")
+        req = urllib.request.Request(
+            self.base + "/authorize",
+            data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            opener.open(req, timeout=10)
+            self.fail("expected 302")
+        except urllib.error.HTTPError as e:
+            loc = e.headers["Location"]
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
+        bad_form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://client.example/cb",
+            "code_verifier": "wrong-verifier",
+            "resource": self.public_url + "/mcp",
+        }
+        req = urllib.request.Request(
+            self.base + "/token",
+            data=urllib.parse.urlencode(bad_form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("expected 400")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 400)
+            self.assertIn("PKCE", e.read().decode())
+
+    def test_plain_pkce_method_rejected(self):
+        status, _, body = self._get(
+            "/authorize?response_type=code&client_id=x"
+            "&redirect_uri=https://client.example/cb"
+            "&code_challenge=abc&code_challenge_method=plain"
+            "&resource=" + self.public_url.replace(":", "%3A") + "%2Fmcp",
+            token=None,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("S256", body.decode())
+
+    # -- regression tests for review findings ---------------------------------
+
+    def test_exercise_name_normalization_no_fake_pr(self):
+        sid = self._new_session()
+        self._call(sid, "log_workout", {
+            "exercise": "Deadlift",
+            "sets": [{"reps": 5, "weight": 80}],
+        })
+        res = self._call(sid, "log_workout", {
+            "exercise": " Deadlift",  # leading space, lighter weight
+            "sets": [{"reps": 5, "weight": 70}],
+        })
+        self.assertFalse(res["isError"])
+        self.assertNotIn("New PR", res["content"][0]["text"])
+        prs = self._call(sid, "get_personal_records", {})
+        text = prs["content"][0]["text"]
+        # one entry only, max still 80
+        self.assertEqual(text.count("Deadlift"), 1)
+        self.assertIn("80", text)
+
+    def test_case_insensitive_pr_grouping(self):
+        sid = self._new_session()
+        self._call(sid, "log_workout", {
+            "exercise": "barbell row",
+            "sets": [{"reps": 5, "weight": 80}],
+        })
+        self._call(sid, "log_workout", {
+            "exercise": "Barbell Row",
+            "sets": [{"reps": 5, "weight": 82}],
+        })
+        prs = self._call(sid, "get_personal_records", {})
+        text = prs["content"][0]["text"]
+        self.assertEqual(text.lower().count("barbell row"), 1)
+        self.assertIn("82", text)
+        # history is consistent: one filter finds both
+        hist = self._call(sid, "get_history", {"exercise": "BARBELL ROW"})
+        self.assertIn("82", hist["content"][0]["text"])
+        self.assertIn("80", hist["content"][0]["text"])
+
+    def test_date_must_be_yyyy_mm_dd(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_workout", {
+            "exercise": "Squat",
+            "sets": [{"reps": 5, "weight": 100}],
+            "date": "yesterday",
+        })
+        self.assertTrue(res["isError"])
+        self.assertIn("YYYY-MM-DD", res["content"][0]["text"])
+        res = self._call(sid, "log_protein", {"grams": 30, "date": "tomorrow"})
+        self.assertTrue(res["isError"])
+
+    def test_nan_inf_rejected(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_workout", {
+            "exercise": "Deadlift",
+            "sets": [{"reps": 5, "weight": 1e309}],  # inf
+        })
+        self.assertTrue(res["isError"])
+        self.assertNotIn("inf", res["content"][0]["text"].lower())
+        res = self._call(sid, "log_protein", {"grams": float("nan")})
+        self.assertTrue(res["isError"])
+
+    def test_estimated_1rm_uses_best_set(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_workout", {
+            "exercise": "Squat",
+            "sets": [{"reps": 1, "weight": 100}, {"reps": 10, "weight": 95}],
+        })
+        text = res["content"][0]["text"]
+        # 95x10 -> Epley ~126.7, higher than 100x1 -> 103.3
+        self.assertIn("New estimated 1RM", text)
+        self.assertIn("126.7", text)
+        prs = self._call(sid, "get_personal_records", {})
+        self.assertIn("126.7", prs["content"][0]["text"])
+
+    def test_array_params_gives_32602(self):
+        sid = self._new_session()
+        status, _, body = self._post(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": [{"name": "ping"}]},
+            session=sid,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["error"]["code"], -32602)
+
+    def test_batch_rejected(self):
+        sid = self._new_session()
+        status, _, body = self._post(
+            [{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
+            session=sid,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["code"], -32600)
+
+    def test_lb_unit_converted_to_kg(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_workout", {
+            "exercise": "Overhead Press",
+            "sets": [{"reps": 5, "weight": 176.37}],  # ~= 80 kg
+            "unit": "lb",
+        })
+        text = res["content"][0]["text"]
+        self.assertFalse(res["isError"])
+        self.assertIn("lb", text)
+        prs = self._call(sid, "get_personal_records", {})
+        # stored in kg: 176.37 lb -> 80.0 kg
+        self.assertIn("80", prs["content"][0]["text"])
+
+    def test_protein_past_date_label(self):
+        sid = self._new_session()
+        res = self._call(sid, "log_protein",
+                         {"grams": 25, "date": "2026-09-29"})
+        text = res["content"][0]["text"]
+        self.assertFalse(res["isError"])
+        self.assertIn("Total on 2026-09-29", text)
+        self.assertNotIn("Total today", text)
 
 
 if __name__ == "__main__":
