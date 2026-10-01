@@ -1,7 +1,9 @@
 # Exposing the server publicly (Cloudflare Tunnel)
 
 The FitLog MCP server binds to loopback only. To make it reachable by Alexa+,
-expose it through a Cloudflare Tunnel (or any HTTPS reverse proxy you prefer).
+expose it through a Cloudflare Tunnel. Do not use any other reverse proxy:
+the login rate limiter honors only Cloudflare's CF-Connecting-IP header, so
+a different proxy in front would break per-client rate limiting.
 
 ## Quick start
 

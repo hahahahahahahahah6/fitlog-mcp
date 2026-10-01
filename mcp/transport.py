@@ -369,18 +369,17 @@ class MCPHandler(BaseHTTPRequestHandler):
 
         Behind Cloudflare Tunnel every connection arrives from the local
         cloudflared process, so client_address[0] is always 127.0.0.1 and
-        would let one attacker's failures lock out the owner. Prefer the
-        Cloudflare-set CF-Connecting-IP header, then the first X-Forwarded-For
-        entry. These headers are only trustworthy because this server binds
-        loopback and is reached through the tunnel proxy; do not expose the
-        server directly on 0.0.0.0 and keep trusting them.
+        would let one attacker's failures lock out the owner. Trust ONLY the
+        Cloudflare-set CF-Connecting-IP header; when it is absent, fall back
+        to the socket peer address. X-Forwarded-For is deliberately ignored:
+        it is client-forgeable, so honoring it would let an attacker rotate
+        fake IPs and bypass the rate limit entirely. This server must only be
+        reached through Cloudflare Tunnel — do not expose it directly on
+        0.0.0.0 and do not put another reverse proxy in front of it.
         """
         cf_ip = (self.headers.get("CF-Connecting-IP") or "").strip()
         if cf_ip:
             return cf_ip
-        xff = (self.headers.get("X-Forwarded-For") or "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
         return self.client_address[0]
 
     def do_POST(self):

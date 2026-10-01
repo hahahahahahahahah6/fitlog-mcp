@@ -874,11 +874,13 @@ class OwnerGateTest(unittest.TestCase):
 
         return dict(re.findall(r'name="([^"]+)" value="([^"]*)"', html_body))
 
-    def _sign_in(self, password, client_ip=None):
+    def _sign_in(self, password, client_ip=None, xff=None):
         """POST the login form; return (status, headers, body, params).
 
         client_ip simulates a distinct remote client behind the tunnel via
         the CF-Connecting-IP header (the socket peer is always 127.0.0.1).
+        xff sends a (possibly forged) X-Forwarded-For header with NO
+        CF-Connecting-IP, to prove the limiter ignores it.
         """
         import urllib.parse
 
@@ -891,6 +893,8 @@ class OwnerGateTest(unittest.TestCase):
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if client_ip:
             headers["CF-Connecting-IP"] = client_ip
+        if xff:
+            headers["X-Forwarded-For"] = xff
         return self._raw(
             "POST", "/authorize",
             body=urllib.parse.urlencode(form).encode(),
@@ -1103,6 +1107,25 @@ class OwnerGateTest(unittest.TestCase):
             status, headers, _ = self._sign_in(self.PASSWORD, owner)
             self.assertEqual(status, 302, "owner login should not be locked")
             self.assertIn("fitlog_owner", headers.get("Set-Cookie", ""))
+        finally:
+            MCPHandler.ctx.login_limiter = LoginRateLimiter()
+
+    def test_rate_limit_ignores_spoofed_x_forwarded_for(self):
+        # X-Forwarded-For is client-forgeable and must never feed the rate
+        # limiter. With no CF-Connecting-IP present, every attempt keys on
+        # the socket peer IP (127.0.0.1 in tests), so rotating forged XFF
+        # values across 5 bad attempts still triggers the lockout on the
+        # 6th attempt.
+        MCPHandler.ctx.login_limiter = LoginRateLimiter()
+        try:
+            for i in range(5):
+                fake_ip = "203.0.113.%d" % (i + 1)
+                status, _, _ = self._sign_in("wrong-pw-%d" % i, xff=fake_ip)
+                self.assertEqual(status, 403, f"attempt {i+1} should be 403")
+            status, _, body = self._sign_in("wrong-pw-5", xff="203.0.113.99")
+            self.assertEqual(status, 429,
+                             "lockout must key on socket peer, not XFF")
+            self.assertIn("Too many", body.decode())
         finally:
             MCPHandler.ctx.login_limiter = LoginRateLimiter()
 
