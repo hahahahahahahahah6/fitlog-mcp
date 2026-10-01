@@ -39,10 +39,11 @@ def answer(q):
         hdr=struct.pack('!HHHHHH',struct.unpack('!H',tid)[0],0x8180,1,len(targets),0,0)
         return hdr+question+ans
     return forward(q)
-# NOTE: sandbox blocks sendto()/sendmsg() (EPERM) but allows connect()+send().
-# Replies MUST come from 127.0.0.1:53 (clients use connected UDP sockets).
-# ALSO: sandbox blocks re-connect() of a UDP socket to a different peer, so
-# use a FRESH sender socket per reply, bound to 127.0.0.1:53 (SO_REUSEADDR).
+# NOTE: on networks where UDP sendto()/sendmsg() is restricted, use
+# connect()+send() instead. Replies must come from 127.0.0.1:53 (clients use
+# connected UDP sockets). Re-connect() of a UDP socket to a different peer
+# may also be blocked, so use a FRESH sender socket per reply, bound to
+# 127.0.0.1:53 (SO_REUSEADDR).
 def udp_reply(resp, addr):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:

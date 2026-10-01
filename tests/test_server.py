@@ -874,8 +874,12 @@ class OwnerGateTest(unittest.TestCase):
 
         return dict(re.findall(r'name="([^"]+)" value="([^"]*)"', html_body))
 
-    def _sign_in(self, password):
-        """POST the login form; return (status, headers, body, params)."""
+    def _sign_in(self, password, client_ip=None):
+        """POST the login form; return (status, headers, body, params).
+
+        client_ip simulates a distinct remote client behind the tunnel via
+        the CF-Connecting-IP header (the socket peer is always 127.0.0.1).
+        """
         import urllib.parse
 
         status, _, body = self._raw(
@@ -884,10 +888,13 @@ class OwnerGateTest(unittest.TestCase):
         self.assertEqual(status, 200)
         form = self._hidden_fields(body.decode())
         form["owner_password"] = password
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if client_ip:
+            headers["CF-Connecting-IP"] = client_ip
         return self._raw(
             "POST", "/authorize",
             body=urllib.parse.urlencode(form).encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers=headers,
         )
 
     def _cookie_value(self, headers):
@@ -1078,6 +1085,25 @@ class OwnerGateTest(unittest.TestCase):
             self.assertEqual(status, 429)
         finally:
             # Reset so later tests are not affected.
+            MCPHandler.ctx.login_limiter = LoginRateLimiter()
+
+    def test_rate_limit_keyed_by_real_ip_behind_tunnel(self):
+        # Behind the tunnel every socket peer is 127.0.0.1, so the limiter
+        # must key on CF-Connecting-IP: an attacker's failures must not
+        # lock out the owner coming from a different IP.
+        MCPHandler.ctx.login_limiter = LoginRateLimiter()
+        try:
+            attacker, owner = "203.0.113.7", "198.51.100.42"
+            for i in range(5):
+                status, _, _ = self._sign_in("wrong-pw-%d" % i, attacker)
+                self.assertEqual(status, 403)
+            status, _, _ = self._sign_in("wrong-pw-5", attacker)
+            self.assertEqual(status, 429, "attacker should be locked out")
+            # The owner, on a different IP, is unaffected.
+            status, headers, _ = self._sign_in(self.PASSWORD, owner)
+            self.assertEqual(status, 302, "owner login should not be locked")
+            self.assertIn("fitlog_owner", headers.get("Set-Cookie", ""))
+        finally:
             MCPHandler.ctx.login_limiter = LoginRateLimiter()
 
 

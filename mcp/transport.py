@@ -364,6 +364,25 @@ class MCPHandler(BaseHTTPRequestHandler):
                 self._rpc_error_envelope(INVALID_REQUEST, "Unknown session."),
             )
 
+    def _client_ip(self) -> str:
+        """Best-effort real client IP for the login rate limiter.
+
+        Behind Cloudflare Tunnel every connection arrives from the local
+        cloudflared process, so client_address[0] is always 127.0.0.1 and
+        would let one attacker's failures lock out the owner. Prefer the
+        Cloudflare-set CF-Connecting-IP header, then the first X-Forwarded-For
+        entry. These headers are only trustworthy because this server binds
+        loopback and is reached through the tunnel proxy; do not expose the
+        server directly on 0.0.0.0 and keep trusting them.
+        """
+        cf_ip = (self.headers.get("CF-Connecting-IP") or "").strip()
+        if cf_ip:
+            return cf_ip
+        xff = (self.headers.get("X-Forwarded-For") or "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0]
+
     def do_POST(self):
         if not self._check_origin():
             return
@@ -389,7 +408,10 @@ class MCPHandler(BaseHTTPRequestHandler):
             form = self._read_form_body()
             if self.ctx.owner_password and "owner_password" in form:
                 # Owner sign-in attempt from the login page.
-                client_ip = self.client_address[0]
+                # Use the real client IP (see _client_ip): behind the tunnel
+                # every socket peer is 127.0.0.1, which would let one
+                # attacker's failures lock out the owner.
+                client_ip = self._client_ip()
                 if self.ctx.login_limiter.is_blocked(client_ip):
                     self._send_html(
                         429,

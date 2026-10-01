@@ -1,29 +1,30 @@
-# Cloudflare Tunnel setup for haocoach.com
+# Exposing the server publicly (Cloudflare Tunnel)
 
-## Status (2026-10-01)
-- Domain haocoach.com purchased ($10.46/yr, expires 2027-09-30).
-- Tunnel `fitlog` created (ID 082c55ab-932b-4614-b27d-2ef9d2b0e285).
-- DNS: mcp.haocoach.com and app.haocoach.com CNAME to the tunnel.
-- BLOCKER: This sandbox blocks outbound TCP except via the egress proxy
-  (which only allows CONNECT to port 443). cloudflared needs port 7844.
-  The proxy says: "ask the user to open Muse settings -> Permissions" to allow TCP.
+The FitLog MCP server binds to loopback only. To make it reachable by Alexa+,
+expose it through a Cloudflare Tunnel (or any HTTPS reverse proxy you prefer).
 
-## To start the tunnel (once TCP is allowed)
+## Quick start
+
+1. Create a tunnel: `cloudflared tunnel create <name>`
+2. Route a hostname to it, e.g. `mcp.example.com` → `http://127.0.0.1:8765`
+   (the port your server listens on).
+3. Start the server with `FITLOG_PUBLIC_URL=https://mcp.example.com` so the
+   OAuth metadata and redirect URIs use the public origin.
+4. Run the tunnel:
+   - named tunnel: `cloudflared tunnel run <name>`
+   - throwaway quick tunnel: `cloudflared tunnel --url http://127.0.0.1:8765`
+
+The MCP endpoint is then `https://mcp.example.com/mcp`.
+
+## Restricted networks: DNS stub
+
+`tunnel/dnsstub.py` is a minimal DNS stub for environments where UDP DNS is
+blocked or IPv6 resolution is broken. It answers the Cloudflare tunnel
+control-plane SRV record directly and forwards everything else to an upstream
+resolver over TCP. You only need it if `cloudflared` cannot resolve DNS on
+its own:
+
 ```bash
-# 1. Start the DNS stub (works around broken IPv6 DNS in sandbox)
-nohup python3 ~/workspace/fitlog-mcp/tunnel/dnsstub.py > /tmp/dnsstub.log 2>&1 &
-# 2. Run cloudflared with the stub as resolver (mount namespace)
-unshare -m bash -c '
-  mount --bind ~/workspace/fitlog-mcp/tunnel/stub-resolv.conf /etc/resolv.conf &&
-  exec cloudflared tunnel --config ~/.cloudflared/config.yml run \
-    --token-file ~/.config/cloudflare/tunnel-token
-'
+nohup python3 tunnel/dnsstub.py > /tmp/dnsstub.log 2>&1 &
+# then run cloudflared with 127.0.0.1 configured as its resolver
 ```
-
-## DNS stub notes
-The sandbox blocks:
-- UDP sendto()/sendmsg() (EPERM) — use connect()+send() instead.
-- Re-connect() of a UDP socket to a different peer — use a fresh socket per reply.
-- Replies must come from 127.0.0.1:53 (clients use connected sockets).
-The stub answers `_v2-origintunneld._tcp.argotunnel.com` SRV directly and
-forwards everything else via TCP to 198.19.0.1:53.

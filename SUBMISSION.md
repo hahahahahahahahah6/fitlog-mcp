@@ -1,6 +1,7 @@
 # Devpost submission draft — fitlog-mcp (Alexa+ track)
 
-> DRAFT. Do not submit yet. Add-on deploys to the dev stage and the demo
+> DRAFT. Do not submit yet. The add-on has not been deployed yet (public
+> tunnel URL not live, so no external round-trip has been measured); demo
 > video still needs recording; package due Oct 23, 2026 12:00 PM PT.
 
 ## Text description
@@ -14,7 +15,8 @@ built-in 5-day split, and track protein against a 160–190 g daily target.
 How it works: a single Python process (stdlib only: `http.server`, `json`,
 `sqlite3`) serves one `/mcp` endpoint, exposed to Alexa+ through an HTTPS
 tunnel and registered as an Alexa+ add-on (`addon-package/addon.json`,
-deployed with the Alexa AI CLI to the development stage). Every `/mcp`
+to be deployed with the Alexa AI CLI to the development stage once the
+public tunnel URL is live). Every `/mcp`
 request needs a bearer token: account linking runs OAuth 2.1
 authorization-code + PKCE (S256), with RFC 9728 Protected Resource Metadata
 and authorization-server metadata served from `/.well-known/`.
@@ -24,8 +26,9 @@ as the Alexa+ checklist requires. The server issues a `Mcp-Session-Id` at
 untrusted origins), rejects unsupported `MCP-Protocol-Version` values with
 400, and rejects JSON-RPC batches (removed in 2025-11-25) with -32600.
 Workouts, PRs, and protein logs live in sqlite; six tools and two resources
-(`program://current`, `pr://all`) expose them. Round trips stay under
-Alexa's 500 ms budget.
+(`program://current`, `pr://all`) expose them. Local request handling is
+lightweight (stdlib `http.server` + sqlite); end-to-end latency over the
+public tunnel has not been measured yet.
 
 Run instructions: `python3 server.py` (Python 3.9+, no `pip install`);
 set `FITLOG_API_TOKEN` for local access, `FITLOG_PUBLIC_URL` to your public
