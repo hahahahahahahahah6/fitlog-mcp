@@ -163,11 +163,11 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     def _owner_logged_in(self) -> bool:
         """True if a valid owner session cookie is present (the /authorize
-        password sign-in sets it). Callers refuse /authorize outright when
-        no owner password is configured, so this is only reached with the
-        gate armed — there is no fail-open path."""
+        password sign-in sets it). Defense in depth: with no owner password
+        configured this returns False — fail-closed even if a future caller
+        forgets the /authorize gate."""
         if not self.ctx.owner_password:
-            return True
+            return False
         cookie = self.headers.get("Cookie") or ""
         value = None
         for part in cookie.split(";"):
