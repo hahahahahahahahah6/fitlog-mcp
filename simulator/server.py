@@ -33,9 +33,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # -- configuration ---------------------------------------------------------
 FITLOG_MCP_URL = os.environ.get("FITLOG_MCP_URL", "http://127.0.0.1:8765").rstrip("/")
+# Browser-facing base for the MCP server's /authorize page. Server-side calls
+# always use FITLOG_MCP_URL (loopback); the browser must be sent to the public
+# URL when the demo is exposed through a tunnel.
+FITLOG_MCP_PUBLIC_URL = os.environ.get(
+    "FITLOG_MCP_PUBLIC_URL", "").rstrip("/") or FITLOG_MCP_URL
 CANONICAL_RESOURCE = FITLOG_MCP_URL + "/mcp"
 SIM_HOST = os.environ.get("SIMULATOR_HOST", "127.0.0.1")
 SIM_PORT = int(os.environ.get("SIMULATOR_PORT", "8799"))
+# When the simulator is exposed publicly (e.g. through a tunnel), the OAuth
+# redirect_uri must be the public https URL, not http://host:port.
+SIM_PUBLIC_URL = os.environ.get("SIMULATOR_PUBLIC_URL", "").rstrip("/")
 PROTOCOL_VERSION = "2025-11-25"
 CLIENT_ID = "alexa-plus-simulator"
 SCOPES = "fitlog.read fitlog.write"
@@ -185,7 +193,10 @@ def _pkce_pair():
 def authorize_url(host: str, port: int) -> str:
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(16)
-    redirect_uri = f"http://{host}:{port}/api/link/callback"
+    if SIM_PUBLIC_URL:
+        redirect_uri = SIM_PUBLIC_URL + "/api/link/callback"
+    else:
+        redirect_uri = f"http://{host}:{port}/api/link/callback"
     resource = canonical_resource()
     PENDING[state] = {"verifier": verifier, "redirect_uri": redirect_uri,
                       "resource": resource, "created": time.time()}
@@ -199,7 +210,9 @@ def authorize_url(host: str, port: int) -> str:
         "scope": SCOPES,
         "state": state,
     })
-    return FITLOG_MCP_URL + "/authorize?" + q
+    # The browser must reach the MCP server's public origin; server-side
+    # calls (token exchange, tools/call) keep using FITLOG_MCP_URL.
+    return FITLOG_MCP_PUBLIC_URL + "/authorize?" + q
 
 
 def exchange_code(code: str, state: str):
