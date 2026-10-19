@@ -25,7 +25,7 @@ Two MCP resources (`program://current`, `pr://all`) expose the training program 
 
 **How I built it.** One Python process, **stdlib only** — `http.server`, `sqlite3`, `json`. No `pip install`, no supply-chain risk, runs anywhere Python 3.9+ exists. A single `/mcp` endpoint speaks **Streamable HTTP per MCP spec 2025-11-25**: `Mcp-Session-Id` lifecycle, mandatory `Origin` validation (DNS-rebinding mitigation), protocol-version checks, and JSON-RPC batches rejected per the spec. Auth follows the Alexa+ checklist to the letter: **OAuth 2.1 authorization-code + PKCE (S256)**, RFC 9728 Protected Resource Metadata, the canonical `resource` parameter on authorize/token requests, and 401s with **no `WWW-Authenticate` header** — exactly as Alexa+ requires. Account linking is the genuine flow, not a mock. **51/51 tests pass**, including the full PKCE round-trip.
 
-**Challenges I ran into.** The official Alexa+ path needs an AWS assume-role that a brand-new developer account can't complete without Solutions Architect onboarding — so I pivoted to a self-hosted deployment over a stable public tunnel and built an Echo-style web simulator that runs the *real* OAuth dance and the *real* tools, so judges can try everything without an Echo or an AWS account. Hand-rolling Streamable HTTP without an SDK meant reading the spec line by line — the 401-without-`WWW-Authenticate` detail alone took a full debugging session. And every tool call had to land under Alexa's 500 ms round-trip budget over the tunnel; it does.
+**Challenges I ran into.** The official Alexa+ path needs an AWS assume-role that a brand-new developer account can't complete without Solutions Architect onboarding — so I pivoted to a self-hosted deployment over a stable public tunnel and built an Echo-style web simulator that runs the *real* OAuth dance and the *real* tools, so judges can try everything without an Echo or an AWS account. Hand-rolling Streamable HTTP without an SDK meant reading the spec line by line — the 401-without-`WWW-Authenticate` detail alone took a full debugging session. And I designed for Alexa's 500 ms round-trip budget: every tool call is one small sqlite query, so the server itself adds only milliseconds on top of the tunnel.
 
 **Try it live.** The demo runs at a fixed public URL right now:
 
@@ -35,6 +35,15 @@ Two MCP resources (`program://current`, `pr://all`) expose the training program 
 Click "Link FitLog account" to run the actual OAuth flow, then type *"log my bench press: 3 sets of 5 at 185 pounds"* and expand the inspector to watch the raw `tools/call` JSON-RPC. The 54-second demo video (`demo/fitlog-demo-54s.mp4`) shows the whole loop.
 
 **What's next.** The Alexa+ add-on package (`addon-package/addon.json`) is ready for the dev stage and points at the stable public endpoint. Next: rest-timer intents ("start a 90-second rest"), weekly volume analytics, and a bodyweight-trend tool — all through the same voice interface.
+
+**Built during the hackathon.** FitLog was started from scratch on 2026-09-30, inside the submission window (Aug 31 – Oct 23, 2026). Everything in the repo — the MCP server, OAuth flow, simulator, tests and add-on package — was written during the window.
+
+## Open Source mini-challenge (also enter this)
+FitLog is a brand-new open-source project released under MIT during the hackathon window, so it qualifies for the Open Source mini-challenge.
+- Contribution URL: https://github.com/hahahahahahahahah6/fitlog-mcp
+- Repo URL: https://github.com/hahahahahahahahah6/fitlog-mcp
+- GitHub username: hahahahahahahahah6
+- What / how / why: A zero-dependency, spec-compliant (MCP 2025-11-25 Streamable HTTP) MCP server with a full OAuth 2.1 + PKCE account-linking flow that follows the Alexa+ auth checklist. Anyone building an Alexa+ add-on can copy the auth and transport layer (`mcp/`) without pulling in an SDK, and the 51 tests double as a reference for what "Alexa+-compliant auth" means in practice.
 
 ## Links
 - GitHub: https://github.com/hahahahahahahahah6/fitlog-mcp (MIT)
@@ -46,7 +55,9 @@ Click "Link FitLog account" to run the actual OAuth flow, then type *"log my ben
 - [ ] Create submission under Build, Ship, Shape → title/tagline/description above
 - [ ] Demo URL: https://app.haocoach.com/
 - [ ] Code repo: https://github.com/hahahahahahahahah6/fitlog-mcp
-- [ ] Upload demo video: `demo/fitlog-demo-54s.mp4` (verified 54.0s, valid; 2026-10-11 decision: NOT re-recording — nice-to-have only, needs live-browser screen capture + narration)
+- [ ] Demo video: Devpost needs a **public YouTube or Vimeo link** (English, under 3 min) — it does not take an mp4 upload. Upload `demo/fitlog-demo-54s.mp4` to YouTube as **Public**, then paste the link. No copyrighted music in it.
+- [ ] Tracks: Alexa+ track **and** the Open Source mini-challenge (section above)
+- [ ] Keep `app.haocoach.com` and `mcp.haocoach.com` online through judging (Nov 9–20) — judges may try the simulator
 - [x] Judge access decision (2026-10-11): do NOT give judges the owner password (it gates his personal training data — violates his no-production-password rule). Judges evaluate via demo video + public simulator + code. If hands-on linking is required, spin up an isolated demo instance with a throwaway password (needs his nod first).
 - [ ] Fill hackathon's required questions (built with: Alexa+ MCP toolkit; track: Alexa+)
 - [ ] Submit before 2026-10-23 12:00 PM PDT
