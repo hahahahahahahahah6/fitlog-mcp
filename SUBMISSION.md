@@ -1,3 +1,5 @@
+> **Outdated draft.** Use `devpost-submission.md` and `friction-log.md` instead.
+
 # Devpost submission draft — fitlog-mcp (Alexa+ track)
 
 > DRAFT. Do not submit yet. The add-on has not been deployed yet (public
