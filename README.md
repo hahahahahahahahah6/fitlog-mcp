@@ -1,5 +1,7 @@
 # fitlog-mcp
 
+[![hahahahahahahahah6/fitlog-mcp MCP server](https://glama.ai/mcp/servers/hahahahahahahahah6/fitlog-mcp/badges/score.svg)](https://glama.ai/mcp/servers/hahahahahahahahah6/fitlog-mcp)
+
 An Alexa+ add-on backed by a self-hosted MCP server that gives Alexa a
 memory for your training: log sets by voice, ask for personal records, get
 today's plan and protein targets.
